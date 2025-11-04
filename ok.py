@@ -1,15 +1,11 @@
 """
-Streamlit HbA1c / A1c reduction extractor (regex-only)
+streamlit_hba1c_extractor.py
 
-Save this file as `streamlit_hba1c_extractor.py` and run:
+Streamlit app that extracts **only the numbers present in the same sentence**
+as an "HbA1c" or "A1c" mention. Uses regex only (no LLMs).
+
+Save this file and run:
     streamlit run streamlit_hba1c_extractor.py
-
-Features:
-- Upload XLSX or CSV
-- Pick text column and sheet (for Excel)
-- Extract reductions using regex (same logic as the earlier script)
-- Show results in an interactive table
-- Download results as Excel
 """
 
 import streamlit as st
@@ -19,7 +15,7 @@ import math
 from io import BytesIO
 
 st.set_page_config(page_title="HbA1c Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c reduction extractor — regex only (no LLM)")
+st.title("HbA1c / A1c reduction extractor — numbers only from same sentence")
 
 # -------------------- regex helpers --------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
@@ -29,16 +25,17 @@ FROM_TO = rf'from\s+({NUM})\s*%\s*(?:to|->|−|—|-)\s*({NUM})\s*%'
 REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ed by|ing)|decrease(?:d)?|drop(?:ped)?|fell|reduced)\s*(?:by\s*)?({NUM})\s*(?:%|\s*{PP_WORD})'
 ABS_PP = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*(?:%|\s*{PP_WORD})'
 RANGE_PCT = rf'({NUM})\s*(?:–|-|—)\s*({NUM})\s*%'
+
 FLAGS = re.IGNORECASE
 re_pct = re.compile(PCT, FLAGS)
 re_fromto = re.compile(FROM_TO, FLAGS)
 re_reduce_by = re.compile(REDUCE_BY, FLAGS)
 re_abs_pp = re.compile(ABS_PP, FLAGS)
 re_range = re.compile(RANGE_PCT, FLAGS)
-re_hba = re.compile(r'\b(?:hba1c|hb a1c|a1c)\b', FLAGS)
-
+re_hba = re.compile(r'\b(?:hba1c|hb\s*a1c|a1c)\b', FLAGS)  # allow optional space in "hb a1c"
 
 def parse_number(s: str) -> float:
+    """Parse numbers that may use comma or dot as decimal separator."""
     if s is None:
         return float('nan')
     s = s.replace(',', '.').strip()
@@ -47,158 +44,117 @@ def parse_number(s: str) -> float:
     except:
         return float('nan')
 
-
 def extract_hba1c_reductions(text: str):
     """
-    Prefer matches that occur on the *same line* as an HbA1c/A1c mention.
-    If no such same-line matches are found, fall back to the previous wider search
-    but mark those matches as `..._fallback` so you can filter them out if desired.
+    Extract matches ONLY from sentences that contain 'hba1c' or 'a1c'.
+    Sentences are split on ., ?, ! or newline. If a sentence contains 'hba1c'/'a1c',
+    we search only that sentence for patterns and return matches. Otherwise return [].
     """
     if not isinstance(text, str):
         return []
+
     matches = []
-    t = text
+    # conservative sentence split: split on punctuation or newline but keep content
+    sentences = re.split(r'(?<=[\.\?!\n])\s+', text)
 
-    # --- 1) line-based search: only consider lines that contain HbA1c/A1c ---
-    lines = re.split(r'[
-]+', t)
-    for li, line in enumerate(lines):
-        if not line.strip():
+    for si, sent in enumerate(sentences):
+        if not sent or not sent.strip():
             continue
-        if re_hba.search(line):
-            # within this line, search for the common patterns
-            for m in re_fromto.finditer(line):
-                a = parse_number(m.group(1))
-                b = parse_number(m.group(2))
-                reduction = None
-                if not math.isnan(a) and not math.isnan(b):
-                    reduction = a - b
-                matches.append({'raw': m.group(0), 'type': 'from-to_same_line', 'values': [a, b], 'reduction_pp': reduction, 'span': (li, m.span())})
+        # Only process sentences mentioning HbA1c / A1c
+        if not re_hba.search(sent):
+            continue
 
-            for m in re_reduce_by.finditer(line):
-                v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'percent_or_pp_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
-
-            for m in re_abs_pp.finditer(line):
-                v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'pp_word_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
-
-            for m in re_range.finditer(line):
-                a = parse_number(m.group(1))
-                b = parse_number(m.group(2))
-                matches.append({'raw': m.group(0), 'type': 'range_percent_same_line', 'values': [a, b], 'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None, 'span': (li, m.span())})
-
-            for m in re_pct.finditer(line):
-                v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'percent_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
-
-    # If we found same-line matches, return those (deduped)
-    if matches:
-        # dedupe by (line, span)
-        seen = set()
-        filtered = []
-        for mm in matches:
-            sp = mm['span']
-            if sp in seen:
-                continue
-            seen.add(sp)
-            filtered.append(mm)
-        return filtered
-
-    # --- 2) fallback: no same-line matches found, run the broader search (previous behavior)
-    # We append "_fallback" to the type so you can filter these out if you want to keep only same-line hits.
-
-    # from X% to Y%  -> compute X - Y
-    for m in re_fromto.finditer(t):
-        a = parse_number(m.group(1))
-        b = parse_number(m.group(2))
-        reduction = None
-        if not math.isnan(a) and not math.isnan(b):
-            reduction = a - b
-        matches.append({
-            'raw': m.group(0),
-            'type': 'from-to_fallback',
-            'values': [a, b],
-            'reduction_pp': reduction,
-            'span': m.span()
-        })
-
-    # explicit "reduced by X%" or similar
-    for m in re_reduce_by.finditer(t):
-        v = parse_number(m.group(1))
-        matches.append({
-            'raw': m.group(0),
-            'type': 'percent_or_pp_fallback',
-            'values': [v],
-            'reduction_pp': v,
-            'span': m.span()
-        })
-
-    # absolute pp phrasing
-    for m in re_abs_pp.finditer(t):
-        v = parse_number(m.group(1))
-        matches.append({
-            'raw': m.group(0),
-            'type': 'pp_word_fallback',
-            'values': [v],
-            'reduction_pp': v,
-            'span': m.span()
-        })
-
-    # ranges like "1.0-1.5%"
-    for m in re_range.finditer(t):
-        a = parse_number(m.group(1))
-        b = parse_number(m.group(2))
-        matches.append({
-            'raw': m.group(0),
-            'type': 'range_percent_fallback',
-            'values': [a, b],
-            'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None,
-            'span': m.span()
-        })
-
-    # percent tokens: restrict to those near any HbA1c word within +/-80 chars (original logic)
-    pct_hits = []
-    for m in re_pct.finditer(t):
-        pct_hits.append((m, parse_number(m.group(1))))
-
-    hba_words = list(re_hba.finditer(t))
-    if hba_words:
-        for m, val in pct_hits:
-            start, end = m.span()
-            near = any(abs(start - hh.span()[0]) <= 80 or abs(end - hh.span()[1]) <= 80 for hh in hba_words)
-            if near:
-                matches.append({
-                    'raw': m.group(0),
-                    'type': 'percent_near_hba1c_fallback',
-                    'values': [val],
-                    'reduction_pp': val,
-                    'span': m.span()
-                })
-    else:
-        for m, val in pct_hits:
+        # 1) from X% to Y%  -> compute X - Y (absolute percentage points)
+        for m in re_fromto.finditer(sent):
+            a = parse_number(m.group(1))
+            b = parse_number(m.group(2))
+            reduction = None
+            if not math.isnan(a) and not math.isnan(b):
+                reduction = a - b
             matches.append({
                 'raw': m.group(0),
-                'type': 'percent_global_fallback',
-                'values': [val],
-                'reduction_pp': val,
+                'type': 'from-to_same_sentence',
+                'values': [a, b],
+                'reduction_pp': reduction,
+                'sentence_index': si,
                 'span': m.span()
             })
 
-    # dedupe by span (original behavior)
-    seen_spans = set()
+        # 2) explicit "reduced by X%" or similar (treat as numeric reduction; ambiguous pp vs %)
+        for m in re_reduce_by.finditer(sent):
+            v = parse_number(m.group(1))
+            matches.append({
+                'raw': m.group(0),
+                'type': 'percent_or_pp_same_sentence',
+                'values': [v],
+                'reduction_pp': v,
+                'sentence_index': si,
+                'span': m.span()
+            })
+
+        # 3) absolute phrasing like "reduction of 1.2 percentage points"
+        for m in re_abs_pp.finditer(sent):
+            v = parse_number(m.group(1))
+            matches.append({
+                'raw': m.group(0),
+                'type': 'pp_word_same_sentence',
+                'values': [v],
+                'reduction_pp': v,
+                'sentence_index': si,
+                'span': m.span()
+            })
+
+        # 4) ranges like "1.0-1.5%"
+        for m in re_range.finditer(sent):
+            a = parse_number(m.group(1))
+            b = parse_number(m.group(2))
+            # choose max value in the range as representative (you can change logic)
+            rep = max(a, b) if not math.isnan(a) and not math.isnan(b) else None
+            matches.append({
+                'raw': m.group(0),
+                'type': 'range_percent_same_sentence',
+                'values': [a, b],
+                'reduction_pp': rep,
+                'sentence_index': si,
+                'span': m.span()
+            })
+
+        # 5) any percent token in that sentence
+        for m in re_pct.finditer(sent):
+            v = parse_number(m.group(1))
+            matches.append({
+                'raw': m.group(0),
+                'type': 'percent_same_sentence',
+                'values': [v],
+                'reduction_pp': v,
+                'sentence_index': si,
+                'span': m.span()
+            })
+
+    # If no matches found in any HbA1c-containing sentence, return empty list
+    if not matches:
+        return []
+
+    # dedupe by (sentence_index, span)
+    seen = set()
     filtered = []
     for mm in matches:
-        sp = mm['span']
-        if sp in seen_spans:
+        key = (mm['sentence_index'], mm['span'])
+        if key in seen:
             continue
-        seen_spans.add(sp)
+        seen.add(key)
         filtered.append(mm)
 
-    filtered.sort(key=lambda x: x['span'][0] if isinstance(x['span'][0], int) else x['span'][0])
+    # sort by sentence index then by match start
+    filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0] if isinstance(x['span'], tuple) else 0))
     return filtered
 
 def choose_best_reduction(matches):
+    """
+    Choose a single 'best' reduction from matches (if any).
+    Strategy: pick the largest absolute numeric reduction_pp.
+    Returns (value_or_None, reason_type_or_empty).
+    """
     best = None
     reason = ''
     for m in matches:
@@ -267,7 +223,6 @@ out_df = process_df(df, col_name)
 
 # Optionally remove rows with null best_reduction_pp (or empty extractions)
 if remove_nulls:
-    # keep rows where best_reduction_pp is not NaN
     out_df = out_df[out_df['best_reduction_pp'].notna()].reset_index(drop=True)
 
 # display
@@ -295,10 +250,9 @@ st.download_button('Download results as Excel', data=excel_bytes, file_name='res
 
 st.markdown('---')
 st.write('**Notes:**')
-st.write('- The extractor uses regex; it normalizes to *absolute percentage points* where possible (e.g., "from 9.0% to 7.5%" -> 1.5).')
-st.write('- Phrases like "reduced by 20%" are captured as numeric 20 (check `reduction_types` to see if it was percent vs pp).')
-st.write('- If you want the app to interpret relative % vs absolute pp differently, tell me and I will update the logic.')
+st.write('- This app returns ONLY numbers/percent tokens that are present in the same sentence as an HbA1c/A1c mention.')
+st.write('- `reductions_pp` contains the numeric values extracted. For `from X% to Y%` patterns, the app computes the absolute difference (X - Y) as percentage points.')
+st.write('- If no sentence in an abstract mentions HbA1c/A1c, that row will have no extracted matches (and will be removed if you checked the Remove rows option).')
 
-st.write('
-')
+st.write('')
 st.write('Made for you — drop your file above and download the cleaned results.')
