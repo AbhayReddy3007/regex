@@ -127,6 +127,7 @@ uploaded = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx',
 col_name = st.sidebar.text_input('Column that contains abstracts/text', value='abstract')
 sheet_name = st.sidebar.text_input('Excel sheet name (leave blank for first sheet)', value='')
 show_raw = st.sidebar.checkbox('Show raw matches column', value=True)
+remove_nulls = st.sidebar.checkbox('Remove rows with no extracted reduction (best_reduction_pp is null)', value=True)
 
 if not uploaded:
     st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
@@ -174,6 +175,11 @@ def process_df(df, text_col):
 
 out_df = process_df(df, col_name)
 
+# Optionally remove rows with null best_reduction_pp (or empty extractions)
+if remove_nulls:
+    # keep rows where best_reduction_pp is not NaN
+    out_df = out_df[out_df['best_reduction_pp'].notna()].reset_index(drop=True)
+
 # display
 st.write('### Results (first 200 rows shown)')
 display_df = out_df.copy()
@@ -203,5 +209,8 @@ st.write('- The extractor uses regex; it normalizes to *absolute percentage poin
 st.write('- Phrases like "reduced by 20%" are captured as numeric 20 (check `reduction_types` to see if it was percent vs pp).')
 st.write('- If you want the app to interpret relative % vs absolute pp differently, tell me and I will update the logic.')
 
-st.write('\n')
+st.write('
+')
 st.write('Made for you — drop your file above and download the cleaned results.')
+
+         
