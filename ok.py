@@ -49,37 +49,115 @@ def parse_number(s: str) -> float:
 
 
 def extract_hba1c_reductions(text: str):
+    """
+    Prefer matches that occur on the *same line* as an HbA1c/A1c mention.
+    If no such same-line matches are found, fall back to the previous wider search
+    but mark those matches as `..._fallback` so you can filter them out if desired.
+    """
     if not isinstance(text, str):
         return []
     matches = []
     t = text
 
-    # from X% to Y% -> X - Y
+    # --- 1) line-based search: only consider lines that contain HbA1c/A1c ---
+    lines = re.split(r'[
+]+', t)
+    for li, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if re_hba.search(line):
+            # within this line, search for the common patterns
+            for m in re_fromto.finditer(line):
+                a = parse_number(m.group(1))
+                b = parse_number(m.group(2))
+                reduction = None
+                if not math.isnan(a) and not math.isnan(b):
+                    reduction = a - b
+                matches.append({'raw': m.group(0), 'type': 'from-to_same_line', 'values': [a, b], 'reduction_pp': reduction, 'span': (li, m.span())})
+
+            for m in re_reduce_by.finditer(line):
+                v = parse_number(m.group(1))
+                matches.append({'raw': m.group(0), 'type': 'percent_or_pp_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+
+            for m in re_abs_pp.finditer(line):
+                v = parse_number(m.group(1))
+                matches.append({'raw': m.group(0), 'type': 'pp_word_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+
+            for m in re_range.finditer(line):
+                a = parse_number(m.group(1))
+                b = parse_number(m.group(2))
+                matches.append({'raw': m.group(0), 'type': 'range_percent_same_line', 'values': [a, b], 'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None, 'span': (li, m.span())})
+
+            for m in re_pct.finditer(line):
+                v = parse_number(m.group(1))
+                matches.append({'raw': m.group(0), 'type': 'percent_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+
+    # If we found same-line matches, return those (deduped)
+    if matches:
+        # dedupe by (line, span)
+        seen = set()
+        filtered = []
+        for mm in matches:
+            sp = mm['span']
+            if sp in seen:
+                continue
+            seen.add(sp)
+            filtered.append(mm)
+        return filtered
+
+    # --- 2) fallback: no same-line matches found, run the broader search (previous behavior)
+    # We append "_fallback" to the type so you can filter these out if you want to keep only same-line hits.
+
+    # from X% to Y%  -> compute X - Y
     for m in re_fromto.finditer(t):
         a = parse_number(m.group(1))
         b = parse_number(m.group(2))
         reduction = None
         if not math.isnan(a) and not math.isnan(b):
             reduction = a - b
-        matches.append({'raw': m.group(0), 'type': 'from-to', 'values': [a, b], 'reduction_pp': reduction, 'span': m.span()})
+        matches.append({
+            'raw': m.group(0),
+            'type': 'from-to_fallback',
+            'values': [a, b],
+            'reduction_pp': reduction,
+            'span': m.span()
+        })
 
     # explicit "reduced by X%" or similar
     for m in re_reduce_by.finditer(t):
         v = parse_number(m.group(1))
-        matches.append({'raw': m.group(0), 'type': 'percent_or_pp', 'values': [v], 'reduction_pp': v, 'span': m.span()})
+        matches.append({
+            'raw': m.group(0),
+            'type': 'percent_or_pp_fallback',
+            'values': [v],
+            'reduction_pp': v,
+            'span': m.span()
+        })
 
     # absolute pp phrasing
     for m in re_abs_pp.finditer(t):
         v = parse_number(m.group(1))
-        matches.append({'raw': m.group(0), 'type': 'pp_word', 'values': [v], 'reduction_pp': v, 'span': m.span()})
+        matches.append({
+            'raw': m.group(0),
+            'type': 'pp_word_fallback',
+            'values': [v],
+            'reduction_pp': v,
+            'span': m.span()
+        })
 
-    # ranges like 1.0-1.5%
+    # ranges like "1.0-1.5%"
     for m in re_range.finditer(t):
         a = parse_number(m.group(1))
         b = parse_number(m.group(2))
-        matches.append({'raw': m.group(0), 'type': 'range_percent', 'values': [a, b], 'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None, 'span': m.span()})
+        matches.append({
+            'raw': m.group(0),
+            'type': 'range_percent_fallback',
+            'values': [a, b],
+            'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None,
+            'span': m.span()
+        })
 
-    # percent tokens
+    # percent tokens: restrict to those near any HbA1c word within +/-80 chars (original logic)
     pct_hits = []
     for m in re_pct.finditer(t):
         pct_hits.append((m, parse_number(m.group(1))))
@@ -90,23 +168,35 @@ def extract_hba1c_reductions(text: str):
             start, end = m.span()
             near = any(abs(start - hh.span()[0]) <= 80 or abs(end - hh.span()[1]) <= 80 for hh in hba_words)
             if near:
-                matches.append({'raw': m.group(0), 'type': 'percent_near_hba1c', 'values': [val], 'reduction_pp': val, 'span': m.span()})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'percent_near_hba1c_fallback',
+                    'values': [val],
+                    'reduction_pp': val,
+                    'span': m.span()
+                })
     else:
         for m, val in pct_hits:
-            matches.append({'raw': m.group(0), 'type': 'percent_global', 'values': [val], 'reduction_pp': val, 'span': m.span()})
+            matches.append({
+                'raw': m.group(0),
+                'type': 'percent_global_fallback',
+                'values': [val],
+                'reduction_pp': val,
+                'span': m.span()
+            })
 
-    # dedupe by span
-    seen = set()
+    # dedupe by span (original behavior)
+    seen_spans = set()
     filtered = []
     for mm in matches:
         sp = mm['span']
-        if sp in seen:
+        if sp in seen_spans:
             continue
-        seen.add(sp)
+        seen_spans.add(sp)
         filtered.append(mm)
-    filtered.sort(key=lambda x: x['span'][0])
-    return filtered
 
+    filtered.sort(key=lambda x: x['span'][0] if isinstance(x['span'][0], int) else x['span'][0])
+    return filtered
 
 def choose_best_reduction(matches):
     best = None
@@ -212,5 +302,3 @@ st.write('- If you want the app to interpret relative % vs absolute pp different
 st.write('
 ')
 st.write('Made for you — drop your file above and download the cleaned results.')
-
-         
