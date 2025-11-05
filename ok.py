@@ -301,6 +301,4 @@ st.write('- The extractor uses regex; it normalizes to *absolute percentage poin
 st.write('- Phrases like "reduced by 20%" are captured as numeric 20 (check `reduction_types` to see if it was percent vs pp).')
 st.write('- If you want the app to interpret relative % vs absolute pp differently, tell me and I will update the logic.')
 
-st.write('
-')
 st.write('Made for you — drop your file above and download the cleaned results.')
