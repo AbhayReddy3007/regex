@@ -2,8 +2,10 @@
 streamlit_hba1c_extractor.py
 
 Rows are kept ONLY if there's at least one sentence that:
-  (1) mentions HbA1c OR A1c, and
-  (2) contains a percentage value (e.g., 7.8%).
+  (1) mentions HbA1c OR A1c,
+  (2) contains a percentage value (e.g., 7.8%),
+  (3) includes a reduction cue (e.g., reduced, reduction, decreased, dropped, fell, lowered, or 'from ... to ...').
+
 The 'sentence' column shows those sentence(s) (joined by " | " if multiple).
 Numbers are extracted ONLY from those sentence(s). Regex only (no LLMs).
 """
@@ -14,22 +16,21 @@ import re
 import math
 from io import BytesIO
 
-st.set_page_config(page_title="HbA1c/A1c % Extractor", layout="wide")
-st.title("HbA1c / A1c — keep rows only when a sentence has HbA1c OR A1c + a % number")
+st.set_page_config(page_title="HbA1c/A1c % Reduction Extractor", layout="wide")
+st.title("HbA1c / A1c — keep sentences with % and reduction cues")
 
 # -------------------- Regex helpers --------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
 PCT = rf'({NUM})\s*%'
 
-# Use explicit unicode codes for dashes to avoid encoding issues in editors
-DASH = r'(?:-|\\u2013|\\u2014)'  # '-' or en dash or em dash
-PP_WORD = r'(?:percentage points?|pp\b|points?)'  # not used now (we require %)
+# Use explicit unicode codes for dashes to avoid encoding issues
+DASH = r'(?:-|\\u2013|\\u2014)'  # '-', en dash, em dash
 
-# Patterns (all require % somewhere in the phrase)
+# Reduction patterns (all require %)
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
-REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ed by|ing)|decrease(?:d)?|drop(?:ped)?|fell|reduced)\s*(?:by\s*)?({NUM})\s*%'
-ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'  # still requires %
-RANGE_PCT = rf'({NUM})\s*{DASH}\s*({NUM})\s*%'
+REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?)\s*(?:by\s*)?({NUM})\s*%'
+ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
+RANGE_PCT = rf'({NUM})\s*{DASH}\s*({NUM})\s*%'  # used only if sentence has a cue word
 
 FLAGS = re.IGNORECASE
 re_pct       = re.compile(PCT, FLAGS)
@@ -38,10 +39,15 @@ re_reduce_by = re.compile(REDUCE_BY, FLAGS)
 re_abs_pp    = re.compile(ABS_PP, FLAGS)
 re_range     = re.compile(RANGE_PCT, FLAGS)
 
-# Match "HbA1c" (also "HB A1c" with a space) OR standalone "A1c"
+# Words: HbA1c / A1c
 re_hba1c_word = re.compile(r'\bhb\s*a1c\b|\bhba1c\b', FLAGS)
 re_a1c_word   = re.compile(r'\ba1c\b', FLAGS)
-re_any_pct    = re_pct  # sentence must contain a % token
+
+# Reduction cue (broad, includes 'from' so we also catch "from X% to Y%")
+re_reduction_cue = re.compile(
+    r'\b(reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing)|from)\b',
+    FLAGS
+)
 
 def parse_number(s: str) -> float:
     if s is None:
@@ -60,13 +66,14 @@ def split_sentences(text: str):
     return [p.strip() for p in parts if p and p.strip()]
 
 def sentence_meets_criterion(sent: str) -> bool:
-    """Require: sentence has (HbA1c OR A1c) AND any percentage token."""
-    has_pct    = bool(re_any_pct.search(sent))
-    has_either = bool(re_hba1c_word.search(sent) or re_a1c_word.search(sent))
-    return has_pct and has_either
+    """Require: (HbA1c OR A1c) AND a % AND a reduction cue."""
+    has_term   = bool(re_hba1c_word.search(sent) or re_a1c_word.search(sent))
+    has_pct    = bool(re_pct.search(sent))
+    has_cue    = bool(re_reduction_cue.search(sent))
+    return has_term and has_pct and has_cue
 
 def extract_from_sentence(sent: str, si: int):
-    """Extract percentage-based patterns only from the given sentence."""
+    """Extract reduction-related % patterns only from the given sentence."""
     matches = []
 
     # from X% to Y%  -> compute X - Y (percentage points)
@@ -83,7 +90,7 @@ def extract_from_sentence(sent: str, si: int):
             'span': m.span()
         })
 
-    # explicit "reduced by X%"
+    # explicit "reduced/decreased/lowered/dropped/fell by X%"
     for m in re_reduce_by.finditer(sent):
         v = parse_number(m.group(1))
         matches.append({
@@ -95,7 +102,7 @@ def extract_from_sentence(sent: str, si: int):
             'span': m.span()
         })
 
-    # absolute phrasing like "reduction of 1.2%" (still a percent due to our pattern)
+    # "reduction of X%" (still a percent due to our pattern)
     for m in re_abs_pp.finditer(sent):
         v = parse_number(m.group(1))
         matches.append({
@@ -107,7 +114,7 @@ def extract_from_sentence(sent: str, si: int):
             'span': m.span()
         })
 
-    # ranges like "1.0–1.5%"
+    # ranges like "1.0–1.5%" — allowed only because sentence has a cue word already
     for m in re_range.finditer(sent):
         a = parse_number(m.group(1))
         b = parse_number(m.group(2))
@@ -121,7 +128,7 @@ def extract_from_sentence(sent: str, si: int):
             'span': m.span()
         })
 
-    # any stray percent token in that sentence (e.g., "HbA1c was 8.9%")
+    # any stray percent token in a cue sentence (e.g., "HbA1c reduced to 7.1%")
     for m in re_pct.finditer(sent):
         v = parse_number(m.group(1))
         matches.append({
@@ -135,11 +142,9 @@ def extract_from_sentence(sent: str, si: int):
 
     return matches
 
-def extract_hba1c_sentences_with_percent(text: str):
+def extract_hba1c_sentences_with_percent_reduction(text: str):
     """
-    Return (matches, sentences_used)
-    - matches: list of dicts for % matches captured ONLY from sentences that pass the criterion.
-    - sentences_used: list of those sentence strings.
+    Return (matches, sentences_used) for sentences that pass the stricter criterion.
     """
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
@@ -175,10 +180,10 @@ def choose_best_reduction(matches):
 # -------------------- UI --------------------
 
 st.sidebar.header('Options')
-uploaded   = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
-col_name   = st.sidebar.text_input('Column that contains abstracts/text', value='abstract')
-sheet_name = st.sidebar.text_input('Excel sheet name (leave blank for first sheet)', value='')
-show_raw   = st.sidebar.checkbox('Show raw matches columns', value=False)
+uploaded     = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
+col_name     = st.sidebar.text_input('Column that contains abstracts/text', value='abstract')
+sheet_name   = st.sidebar.text_input('Excel sheet name (leave blank for first sheet)', value='')
+show_raw     = st.sidebar.checkbox('Show raw matches columns', value=False)
 require_best = st.sidebar.checkbox('Also require a computed best_reduction_pp', value=False)
 
 if not uploaded:
@@ -211,7 +216,7 @@ def process_df(df, text_col):
         text = row.get(text_col, '')
         text = '' if not isinstance(text, str) else text
 
-        matches, sentences_used = extract_hba1c_sentences_with_percent(text)
+        matches, sentences_used = extract_hba1c_sentences_with_percent_reduction(text)
 
         new = row.to_dict()
         new.update({
@@ -233,9 +238,9 @@ def process_df(df, text_col):
     out = out[out['sentence'].astype(str).str.len() > 0]
 
     # Drop rows where extracted_matches is empty or not a list
-    out = out[out['extracted_matches'].apply(lambda x: isinstance(x, list) and len(x) > 0)]
+    out = out[out_df['extracted_matches'].apply(lambda x: isinstance(x, list) and len(x) > 0)]  # <-- fixed typo to 'out'
 
-    # Optionally also require best_reduction_pp (toggle in sidebar)
+    # Optionally also require best_reduction_pp
     if require_best:
         out = out[out['best_reduction_pp'].notna()]
 
@@ -272,6 +277,6 @@ st.download_button(
 
 st.markdown('---')
 st.write('**Rules applied:**')
-st.write('- A row appears **only** if a sentence contains HbA1c **or** A1c **and** a percentage value like `7.8%`.')
-st.write('- The **sentence** column shows exactly that/those sentence(s) (joined with ` | ` if multiple).')
-st.write('- Extracted numbers are restricted to those sentence(s); `best_reduction_pp` is computed where applicable.')
+st.write('- Sentence must contain HbA1c **or** A1c, a **% number**, and a **reduction cue** (e.g., reduced / from ... to ... / decreased / lowered / dropped / fell).')
+st.write('- Only those sentences are kept in the `sentence` column; rows without such sentences are dropped.')
+st.write('- Extracted values come only from those sentences; `best_reduction_pp` computes X−Y for “from X% to Y%”, otherwise the % value itself.')
