@@ -2,12 +2,10 @@
 streamlit_hba1c_extractor.py
 
 Rows are kept ONLY if there's at least one sentence that:
-  (1) contains BOTH HbA1c (or HB A1c) AND A1c, and
+  (1) mentions HbA1c OR A1c, and
   (2) contains a number.
 The 'sentence' column shows those sentence(s) (joined by " | " if multiple).
 Numbers are extracted ONLY from those sentence(s). Regex only (no LLMs).
-
-Tip: If you want 'either HbA1c OR A1c', set REQUIRE_BOTH = False below.
 """
 
 import streamlit as st
@@ -17,10 +15,7 @@ import math
 from io import BytesIO
 
 st.set_page_config(page_title="HbA1c Sentence Extractor", layout="wide")
-st.title("HbA1c / A1c — keep rows only when a sentence has BOTH HbA1c and A1c + a number")
-
-# ---- config ---------------------------------------------------------------
-REQUIRE_BOTH = True  # <— your requirement: require BOTH HbA1c and A1c in the same sentence
+st.title("HbA1c / A1c — keep rows only when a sentence has HbA1c OR A1c + a number")
 
 # ---- regex helpers --------------------------------------------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
@@ -38,9 +33,10 @@ re_reduce_by = re.compile(REDUCE_BY, FLAGS)
 re_abs_pp = re.compile(ABS_PP, FLAGS)
 re_range = re.compile(RANGE_PCT, FLAGS)
 
-# IMPORTANT: separate patterns so "A1c" inside "HbA1c" doesn't count
-re_hba1c_word = re.compile(r'\bhb\s*a1c\b|\bhba1c\b', FLAGS)  # HbA1c or HB A1c
-re_a1c_word  = re.compile(r'\ba1c\b', FLAGS)                  # standalone A1c
+# Tolerate "HB A1c" with a space; also match "HbA1c"
+re_hba1c_word = re.compile(r'\bhb\s*a1c\b|\bhba1c\b', FLAGS)
+# Standalone A1c (avoid counting the "A1c" inside "HbA1c" again)
+re_a1c_word  = re.compile(r'\ba1c\b', FLAGS)
 re_any_digit = re.compile(r'\d')
 
 def parse_number(s: str) -> float:
@@ -60,15 +56,10 @@ def split_sentences(text: str):
     return [p.strip() for p in parts if p and p.strip()]
 
 def sentence_meets_criterion(sent: str) -> bool:
-    """Require BOTH HbA1c (or HB A1c) and standalone A1c in the SAME sentence, plus a number."""
+    """Require: sentence has (HbA1c OR A1c) AND any number."""
     has_number = bool(re_any_digit.search(sent))
-    if REQUIRE_BOTH:
-        has_hba1c = bool(re_hba1c_word.search(sent))
-        has_a1c   = bool(re_a1c_word.search(sent))
-        return has_number and has_hba1c and has_a1c
-    else:
-        has_either = bool(re_hba1c_word.search(sent) or re_a1c_word.search(sent))
-        return has_number and has_either
+    has_either = bool(re_hba1c_word.search(sent) or re_a1c_word.search(sent))
+    return has_number and has_either
 
 def extract_from_sentence(sent: str, si: int):
     """Extract numeric patterns only from the given sentence."""
@@ -143,8 +134,7 @@ def extract_from_sentence(sent: str, si: int):
 def extract_hba1c_same_sentence(text: str):
     """
     Return (matches, sentences_used)
-    - matches: list of dicts for numbers captured ONLY from sentences that
-      meet the criterion (BOTH HbA1c and A1c present, plus a number).
+    - matches: list of dicts for numbers captured ONLY from sentences that meet the criterion.
     - sentences_used: list of those sentence strings.
     """
     if not isinstance(text, str):
@@ -192,7 +182,7 @@ sheet_name = st.sidebar.text_input('Excel sheet name (leave blank for first shee
 show_raw = st.sidebar.checkbox('Show raw matches columns', value=False)
 
 if not uploaded:
-    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named \"abstract\".")
+    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".")
     st.stop()
 
 # read file
@@ -209,7 +199,7 @@ except Exception as e:
     st.stop()
 
 if col_name not in df.columns:
-    st.error(f'Column \"{col_name}\" not found. Available columns: {list(df.columns)}')
+    st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
     st.stop()
 
 st.success(f'Loaded {len(df)} rows. Processing...')
@@ -271,6 +261,6 @@ st.download_button(
 
 st.markdown('---')
 st.write('**Rules applied:**')
-st.write('- A row appears **only** if a sentence contains BOTH HbA1c (or HB A1c) **and** A1c, and also contains a number.')
+st.write('- A row appears **only** if a sentence contains HbA1c **or** A1c and also contains a number.')
 st.write('- The **sentence** column shows exactly that/those sentence(s) (joined with ` | ` if multiple).')
 st.write('- Extracted numbers are restricted to those sentence(s); `best_reduction_pp` is derived from them.')
