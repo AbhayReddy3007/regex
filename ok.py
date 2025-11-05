@@ -32,7 +32,7 @@ re_fromto = re.compile(FROM_TO, FLAGS)
 re_reduce_by = re.compile(REDUCE_BY, FLAGS)
 re_abs_pp = re.compile(ABS_PP, FLAGS)
 re_range = re.compile(RANGE_PCT, FLAGS)
-re_hba = re.compile(r'\b(?:hba1c|hb\s*a1c|a1c)\b', FLAGS)
+re_hba = re.compile(r'\b(?:hba1c|hb\s*a1c|a1c)\b', FLAGS)  # allow optional space
 re_any_digit = re.compile(r'\d')
 
 def parse_number(s: str) -> float:
