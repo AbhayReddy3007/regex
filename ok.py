@@ -259,6 +259,7 @@ st.download_button(
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
 
+
 st.markdown('---')
 st.write('**Rules applied:**')
 st.write('- A row appears **only** if a sentence contains HbA1c **or** A1c and also contains a number.')
