@@ -1,5 +1,5 @@
 # app.py
-# Streamlit app: Upload file -> create 'sentences' (MASH + resolution) -> 'extracted values' (numbers) -> drop empty rows -> download
+# Streamlit app: Upload file -> 'sentences' (MASH + resolution) -> 'extracted values' (numbers within ±5 words of MASH/resolution) -> drop empty -> download
 
 import io
 import re
@@ -7,32 +7,22 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="MASH Resolution Extractor", layout="wide")
-st.title("MASH + Resolution Sentence & Number Extractor")
+st.title("MASH + Resolution Sentence & Windowed Number Extractor")
 st.caption("Upload an Excel (.xlsx) or CSV with an **abstracts** column.")
 
 uploaded = st.file_uploader("Upload file", type=["xlsx", "csv"])
 
 # ---------------- helpers ----------------
+SENT_JOINER = " || "
+KEYWORDS = {"mash", "resolution"}  # anchors
+WINDOW = 5                         # words on each side
+
 def split_sentences(text: str):
     if not isinstance(text, str) or not text.strip():
         return []
-    # Simple sentence splitter; includes last fragment if no terminal punctuation
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
     parts = [p.strip() for p in parts if p.strip()]
     return parts or [text.strip()]
-
-def extract_numbers(text: str):
-    if not isinstance(text, str) or not text.strip():
-        return []
-    # numbers like 12, 12.5, 1,234.56 with optional trailing %
-    raw = re.findall(r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?', text)
-    out = []
-    for x in raw:
-        if x.endswith('%'):
-            out.append(x[:-1].replace(',', '') + '%')
-        else:
-            out.append(x.replace(',', ''))
-    return out
 
 def build_sentences_column(series: pd.Series) -> pd.Series:
     sent_lists = series.apply(split_sentences)
@@ -41,7 +31,66 @@ def build_sentences_column(series: pd.Series) -> pd.Series:
                      if re.search(r'\bMASH\b', s, re.IGNORECASE)
                      and re.search(r'\bresolution\b', s, re.IGNORECASE)]
     )
-    return filtered.apply(lambda lst: " || ".join(lst))
+    return filtered.apply(lambda lst: SENT_JOINER.join(lst))
+
+def _strip_punct(word: str) -> str:
+    # remove leading/trailing punctuation for keyword matching
+    return re.sub(r'^\W+|\W+$', '', word or '')
+
+def _window_numbers_from_sentence(sentence: str, window: int = WINDOW):
+    """
+    Return numbers within ±window words of any occurrence of 'MASH' or 'resolution'.
+    Keeps percent if present (e.g., 12% or '12 %').
+    Handles 1,234.56 formats.
+    """
+    if not isinstance(sentence, str) or not sentence.strip():
+        return []
+
+    tokens = sentence.split()
+    # indices of anchor tokens (case-insensitive, ignoring surrounding punctuation)
+    anchor_idxs = [
+        i for i, tok in enumerate(tokens)
+        if _strip_punct(tok).lower() in KEYWORDS
+    ]
+    if not anchor_idxs:
+        return []
+
+    hits, seen = [], set()
+
+    # pattern: number with optional decimals and thousands; optional % (possibly spaced)
+    # We'll scan window text, then normalize commas; keep % if present.
+    num_re = re.compile(r'((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*%)?')
+
+    for i in anchor_idxs:
+        start = max(0, i - window)
+        end = min(len(tokens), i + window + 1)
+        window_text = " ".join(tokens[start:end])
+
+        for m in num_re.finditer(window_text):
+            num = m.group(1).replace(',', '')
+            has_pct = bool(m.group(2))
+            val = num + ('%' if has_pct else '')
+            if val and val not in seen:
+                seen.add(val)
+                hits.append(val)
+
+    return hits
+
+def extract_windowed_numbers_from_sentences_field(sentences_field: str):
+    """
+    The 'sentences' column may contain multiple sentences joined by SENT_JOINER.
+    We apply the windowed extractor per sentence and de-duplicate while preserving order.
+    """
+    if not isinstance(sentences_field, str) or not sentences_field.strip():
+        return []
+    all_vals, seen = [], set()
+    for sent in sentences_field.split(SENT_JOINER):
+        vals = _window_numbers_from_sentence(sent)
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                all_vals.append(v)
+    return all_vals
 
 # ---------------- main ----------------
 if uploaded is None:
@@ -68,21 +117,25 @@ else:
         # 1) sentences column (must contain BOTH 'MASH' and 'resolution')
         df['sentences'] = build_sentences_column(df['abstracts'])
 
-        # 2) extracted values column (all numeric tokens from sentences)
+        # 2) extracted values column (only numbers within ±5 words of MASH/resolution)
         df['extracted values'] = df['sentences'].apply(
-            lambda s: ", ".join(extract_numbers(s)) if isinstance(s, str) else ""
+            lambda s: ", ".join(extract_windowed_numbers_from_sentences_field(s)) if isinstance(s, str) else ""
         )
 
-        # 3) drop rows where sentences is empty
+        # 3) drop rows where 'sentences' is empty
         has_sentences = df['sentences'].astype(str).str.strip().astype(bool)
         df = df[has_sentences].copy()
 
-        # 4) drop rows where extracted values is empty
+        # 4) drop rows where 'extracted values' is empty
         has_values = df['extracted values'].astype(str).str.strip().astype(bool)
         df_out = df[has_values].copy()
 
         if df_out.empty:
-            st.warning("No rows left after filtering: either no matching sentences, or no numeric values in them.")
+            st.warning(
+                "No rows left after filtering. "
+                "Either there are no sentences containing both 'MASH' and 'resolution', "
+                "or there are no numbers within ±5 words of those keywords."
+            )
         else:
             st.success(f"Processed {len(df_out)} rows.")
             st.subheader("Preview")
