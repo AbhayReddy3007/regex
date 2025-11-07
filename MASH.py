@@ -7,59 +7,95 @@ import streamlit as st
 st.set_page_config(page_title="MASH Resolution Extractor", layout="wide")
 st.title("MASH + Resolution Sentence & Number Extractor")
 
-uploaded = st.file_uploader("Upload an Excel file (.xlsx) with an 'abstracts' column", type=["xlsx"])
+st.caption("Upload an Excel (.xlsx) or CSV with an **abstracts** column.")
 
+uploaded = st.file_uploader("Upload file", type=["xlsx", "csv"])
+
+# ---------- helpers ----------
 def split_sentences(text: str):
     if not isinstance(text, str) or not text.strip():
         return []
-    # Basic sentence splitter; keeps URLs/decimals intact reasonably well
+    # Simple sentence splitter; handles cases with no punctuation
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    # If the whole abstract has no sentence punctuation, treat it as one sentence
-    if len(parts) == 1:
-        return [text.strip()]
-    return [p.strip() for p in parts if p.strip()]
+    return [p.strip() for p in parts if p.strip()] or [text.strip()]
 
 def extract_numbers(text: str):
     if not isinstance(text, str) or not text.strip():
         return []
-    # Match numbers like 12, 12.5, 1,234.56, and optional trailing %
+    # numbers like 12, 12.5, 1,234.56 with optional %
     raw = re.findall(r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?', text)
-    # Normalize commas in thousands groups (e.g., 1,234 -> 1234)
-    cleaned = []
+    out = []
     for x in raw:
         if x.endswith('%'):
-            num = x[:-1].replace(',', '')
-            cleaned.append(num + '%')
+            out.append(x[:-1].replace(',', '') + '%')
         else:
-            cleaned.append(x.replace(',', ''))
-    return cleaned
+            out.append(x.replace(',', ''))
+    return out
 
-if uploaded:
-    df = pd.read_excel(uploaded)
+# ---------- UI + processing ----------
+if uploaded is None:
+    st.info("⬆️ Choose a file to begin.")
+else:
+    try:
+        # Read file
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
 
-    if 'abstracts' not in df.columns:
-        st.error("The file must contain a column named 'abstracts'.")
-        st.stop()
+        st.write("**Columns detected:**", list(df.columns))
 
-    # Build sentences column: sentences that contain BOTH 'MASH' and 'resolution' (case-insensitive)
-    sent_lists = df['abstracts'].apply(split_sentences)
-    mask_both = sent_lists.apply(
-        lambda lst: [s for s in lst if re.search(r'\bMASH\b', s, re.IGNORECASE) and re.search(r'\bresolution\b', s, re.IGNORECASE)]
-    )
-    # Join with a clear separator so it's Excel-friendly
-    df['sentences'] = mask_both.apply(lambda lst: " || ".join(lst))
+        if 'abstracts' not in df.columns:
+            st.error("The file must contain a column named **abstracts**.")
+            st.stop()
 
-    # Extract numbers from the 'sentences' text
-    df['extracted values'] = df['sentences'].apply(lambda s: ", ".join(extract_numbers(s)))
+        # Build 'sentences' column: sentences containing BOTH 'MASH' and 'resolution' (case-insensitive)
+        sent_lists = df['abstracts'].apply(split_sentences)
+        filtered = sent_lists.apply(
+            lambda lst: [s for s in lst
+                         if re.search(r'\bMASH\b', s, re.IGNORECASE)
+                         and re.search(r'\bresolution\b', s, re.IGNORECASE)]
+        )
+        df['sentences'] = filtered.apply(lambda lst: " || ".join(lst))
 
-    # Drop rows where 'sentences' is empty
-    df_out = df[df['sentences'].str.strip().astype(bool)].copy()
+        # Extract numbers from those sentences
+        df['extracted values'] = df['sentences'].apply(
+            lambda s: ", ".join(extract_numbers(s)) if isinstance(s, str) else ""
+        )
 
-    st.subheader("Preview")
-    st.dataframe(df_out.head(50), use_container_width=True)
+        # Drop rows with empty 'sentences'
+        has_sentences = df['sentences'].astype(str).str.strip().astype(bool)
+        df_out = df[has_sentences].copy()
 
-    # Download button
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="output")
-    st.download_button("Download processed Excel", data=buf.getvalue(), file_name="processed_mash_resolution.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if df_out.empty:
+            st.warning("No sentences found containing both 'MASH' and 'resolution'.")
+        else:
+            st.success(f"Processed {len(df_out)} rows with matching sentences.")
+            st.subheader("Preview")
+            st.dataframe(df_out.head(50), use_container_width=True)
+
+        # Download button
+        buf = io.BytesIO()
+        if uploaded.name.lower().endswith(".csv"):
+            df_out.to_csv(buf, index=False)
+            data = buf.getvalue()
+            st.download_button(
+                "Download processed CSV",
+                data=data,
+                file_name="processed_mash_resolution.csv",
+                mime="text/csv"
+            )
+        else:
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                df_out.to_excel(writer, index=False, sheet_name="output")
+            st.download_button(
+                "Download processed Excel",
+                data=buf.getvalue(),
+                file_name="processed_mash_resolution.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+    except Exception as e:
+        # Show full traceback in the app so you never get a silent blank screen
+        st.error("Something went wrong while processing your file.")
+        st.exception(e)
