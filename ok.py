@@ -7,18 +7,17 @@ Rules:
   (2) contains a % number,
   (3) includes a reduction cue (reduced/decreased/lowered/dropped/fell/declined or 'from ... to ...').
 
-- Within each qualifying sentence, keep only % values NEAR the HbA1c/A1c mention (proximity window)
-  so unrelated values like body weight (-4.3%) are ignored.
+- Within each qualifying sentence, take ONLY the % values within the NEXT 4 WORDS
+  after each HbA1c/A1c mention (avoids unrelated values like body-weight %).
 
-- Strict filter: keep ONLY values < 7.
-  * For from→to, the extracted value is the difference (X − Y), and that delta must also be < 7.
+- Strict numeric filter: keep ONLY values < 7.
+  * For from→to, the extracted value is (X − Y) and must also be < 7.
 
 Outputs per row:
 - sentence (the qualifying sentence(s))
-- extracted_matches (delta for from→to, raw % for others)
-- reductions_pp (numbers)
+- extracted_matches (delta% for from→to, raw % for others)
+- reductions_pp (numbers used, including computed delta)
 - reduction_types
-- best_reduction_pp
 """
 
 import streamlit as st
@@ -28,7 +27,7 @@ import math
 from io import BytesIO
 
 st.set_page_config(page_title="HbA1c/A1c % Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c — % reductions tied to HbA1c (strict < 7)")
+st.title("HbA1c / A1c — % reductions within next 4 words (strict < 7)")
 
 # -------------------- Regex helpers --------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
@@ -55,6 +54,7 @@ re_reduction_cue = re.compile(
     FLAGS
 )
 
+# -------------------- Utilities --------------------
 def parse_number(s: str) -> float:
     if s is None:
         return float('nan')
@@ -78,89 +78,83 @@ def sentence_meets_criterion(sent: str) -> bool:
     has_cue  = bool(re_reduction_cue.search(sent))
     return has_term and has_pct and has_cue
 
-# -------- HbA1c-tied extraction inside one sentence (proximity windows) --------
-HB_SCOPE_LEFT  = 50   # chars to the left of HbA1c hit
-HB_SCOPE_RIGHT = 80   # chars to the right of HbA1c hit
+# -------- HbA1c-tied extraction: NEXT 4 WORDS after HbA1c mention --------
+def _next_n_words_window(s: str, start: int, n: int = 4):
+    """Return (segment, abs_start, abs_end) covering the next n tokens (\S+) after index 'start'."""
+    sub = s[start:]
+    end_rel = 0
+    count = 0
+    for m in re.finditer(r'\S+', sub):
+        end_rel = m.end()
+        count += 1
+        if count >= n:
+            break
+    if count == 0:
+        return '', start, start
+    abs_start = start
+    abs_end = start + end_rel
+    return s[abs_start:abs_end], abs_start, abs_end
 
-def _add(match_list, si, span_offset, m, typ, values, reduction):
+def _add(match_list, si, seg_abs_start, m, typ, values, reduction):
     match_list.append({
         'raw': m.group(0),
         'type': typ,
         'values': values,
         'reduction_pp': reduction,
         'sentence_index': si,
-        'span': (span_offset + m.start(), span_offset + m.end())
+        'span': (seg_abs_start + m.start(), seg_abs_start + m.end())
     })
 
-def extract_hba1c_tied_matches_in_sentence(sent: str, si: int):
-    """
-    Extract ONLY % values that are tied to HbA1c/A1c by proximity:
-    For each HbA1c/A1c mention, take a small window around it and search there.
-    """
+def extract_next4_in_sentence(sent: str, si: int):
+    """Within a sentence, take only matches inside the next 4-word window after each HbA1c/A1c hit."""
     matches = []
-    hits = list(re_hba1c.finditer(sent))
-    if not hits:
-        return matches
-
-    for h in hits:
-        s = max(0, h.start() - HB_SCOPE_LEFT)
-        e = min(len(sent), h.end() + HB_SCOPE_RIGHT)
-        seg = sent[s:e]
-
-        # from X% to Y%  -> compute X - Y (percentage points)
+    for hh in re_hba1c.finditer(sent):
+        seg, abs_s, _ = _next_n_words_window(sent, hh.end(), 4)
+        if not seg:
+            continue
+        # from X% to Y%
         for m in re_fromto.finditer(seg):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             red = None if math.isnan(a) or math.isnan(b) else (a - b)
-            _add(matches, si, s, m, 'from-to_hba_scope', [a, b], red)
-
-        # explicit "... by X%"
+            _add(matches, si, abs_s, m, 'from-to_next4', [a, b], red)
+        # reduced/decreased/... by X%
         for m in re_reduce_by.finditer(seg):
             v = parse_number(m.group(1))
-            _add(matches, si, s, m, 'percent_or_pp_hba_scope', [v], v)
-
-        # "reduction of X%"
+            _add(matches, si, abs_s, m, 'percent_or_pp_next4', [v], v)
+        # reduction of X%
         for m in re_abs_pp.finditer(seg):
             v = parse_number(m.group(1))
-            _add(matches, si, s, m, 'pp_word_hba_scope', [v], v)
-
-        # ranges like "1.0–1.5%"
+            _add(matches, si, abs_s, m, 'pp_word_next4', [v], v)
+        # ranges 1.0–1.5%
         for m in re_range.finditer(seg):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             rep = None if math.isnan(a) or math.isnan(b) else max(a, b)
-            _add(matches, si, s, m, 'range_percent_hba_scope', [a, b], rep)
-
-        # any % token in the proximity window
+            _add(matches, si, abs_s, m, 'range_percent_next4', [a, b], rep)
+        # any % token
         for m in re_pct.finditer(seg):
             v = parse_number(m.group(1))
-            _add(matches, si, s, m, 'percent_hba_scope', [v], v)
+            _add(matches, si, abs_s, m, 'percent_next4', [v], v)
 
-    # dedupe by absolute span within the sentence
-    seen = set()
-    out = []
+    # dedupe by span inside sentence
+    seen = set(); out = []
     for mm in matches:
-        key = (mm['span'][0], mm['span'][1])
-        if key in seen:
+        if mm['span'] in seen:
             continue
-        seen.add(key)
+        seen.add(mm['span'])
         out.append(mm)
-
     out.sort(key=lambda x: x['span'][0])
     return out
 
-def extract_hba1c_sentences(text: str):
-    """
-    Return (matches, sentences_used) for sentences that pass the criterion.
-    Within those, only keep % values tied to HbA1c via proximity windows.
-    """
+def extract_hba1c_sentences_next4(text: str):
+    """Return (matches, sentences_used) for sentences meeting the criterion, using next-4-words windows."""
     matches, sentences_used = [], []
-    sentences = split_sentences(text)
-    for si, sent in enumerate(sentences):
+    for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent):
             continue
         sentences_used.append(sent)
-        matches.extend(extract_hba1c_tied_matches_in_sentence(sent, si))
+        matches.extend(extract_next4_in_sentence(sent, si))
 
-    # dedupe globally by sentence-span
+    # dedupe globally by (sentence_index, span)
     seen, filtered = set(), []
     for mm in matches:
         key = (mm['sentence_index'], mm['span'])
@@ -172,29 +166,15 @@ def extract_hba1c_sentences(text: str):
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
-def choose_best_reduction(matches):
-    """Pick the largest absolute reduction_pp from matches, if any."""
-    best, reason = None, ''
-    for m in matches:
-        v = m.get('reduction_pp')
-        if v is None or (isinstance(v, float) and math.isnan(v)):
-            continue
-        if best is None or abs(v) > abs(best):
-            best = v
-            reason = m.get('type', '')
-    return best, reason
-
 # -------------------- UI --------------------
-
 st.sidebar.header('Options')
 uploaded     = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
 col_name     = st.sidebar.text_input('Column with abstracts/text', value='abstract')
 sheet_name   = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
-show_raw     = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
-require_best = st.sidebar.checkbox('Also require best_reduction_pp to exist', value=False)
+show_debug   = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
 
 if not uploaded:
-    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
+    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named \"abstract\".')
     st.stop()
 
 # read file
@@ -211,7 +191,7 @@ except Exception as e:
     st.stop()
 
 if col_name not in df.columns:
-    st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
+    st.error(f'Column \"{col_name}\" not found. Available columns: {list(df.columns)}')
     st.stop()
 
 st.success(f'Loaded {len(df)} rows. Processing...')
@@ -223,10 +203,9 @@ def process_df(df, text_col):
         text = row.get(text_col, '')
         text = '' if not isinstance(text, str) else text
 
-        matches, sentences_used = extract_hba1c_sentences(text)
+        matches, sentences_used = extract_hba1c_sentences_next4(text)
 
-        # STRICT FILTER: keep only values < 7
-        # Prefer the computed reduction_pp when present (covers from→to and "reduced by")
+        # STRICT FILTER: keep only values < 7 (prefer computed reduction_pp if present)
         def _allowed(m):
             rp = m.get('reduction_pp')
             if rp is not None and not (isinstance(rp, float) and math.isnan(rp)):
@@ -242,17 +221,16 @@ def process_df(df, text_col):
 
         matches = [m for m in matches if _allowed(m)]
 
-        # format: in from→to cases, extracted value should be the computed difference (reduction_pp)
+        # formatting: show delta% for from→to, raw % otherwise
         def _fmt_pct(v):
             if v is None or (isinstance(v, float) and math.isnan(v)):
                 return ''
-            s = f"{float(v):.3f}".rstrip('0').rstrip('.')
-            return f"{s}%"
-
+            s = f\"{float(v):.3f}\".rstrip('0').rstrip('.')
+            return f\"{s}%\"
         def _fmt_extracted(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                return _fmt_pct(m.get('reduction_pp'))  # show the delta only
+                return _fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
         new = row.to_dict()
@@ -261,11 +239,6 @@ def process_df(df, text_col):
             'extracted_matches': [_fmt_extracted(m) for m in matches],
             'reductions_pp': [m.get('reduction_pp') for m in matches],
             'reduction_types': [m.get('type') for m in matches],
-        })
-        best, reason = choose_best_reduction(matches)
-        new.update({
-            'best_reduction_pp': best,
-            'best_reduction_reason': reason
         })
         rows.append(new)
 
@@ -277,10 +250,6 @@ def process_df(df, text_col):
     # Drop rows where extracted_matches is empty or not a list
     out = out[out['extracted_matches'].apply(lambda x: isinstance(x, list) and len(x) > 0)]
 
-    # Optionally also require best_reduction_pp
-    if require_best:
-        out = out[out['best_reduction_pp'].notna()]
-
     return out.reset_index(drop=True)
 
 out_df = process_df(df, col_name)
@@ -288,11 +257,12 @@ out_df = process_df(df, col_name)
 # display
 st.write('### Results (first 200 rows shown)')
 display_df = out_df.copy()
-# Always show 'extracted_matches' and 'sentence'; optionally hide only debug columns
-if not show_raw:
+# Always show 'extracted_matches' and 'sentence'; optionally hide debug columns
+if not show_debug:
     for c in ['reductions_pp', 'reduction_types']:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
+
 st.dataframe(display_df.head(200))
 
 # download
@@ -315,5 +285,5 @@ st.download_button(
 st.markdown('---')
 st.write('**Rules enforced:**')
 st.write('- Sentence must contain HbA1c **or** A1c, a **% number**, and a **reduction cue**.')
-st.write('- Only % values **near** an HbA1c/A1c mention are kept (prevents picking up weight %).')
+st.write('- Only % values within the **next 4 words** after HbA1c/A1c are considered.')
 st.write('- **Strict filter**: keep only values **< 7**. For from→to, the extracted value is the **delta** and must also be < 7.')
