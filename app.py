@@ -6,6 +6,10 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
+# ================== HARD-CODED GEMINI API KEY ==================
+API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"   # <-- replace with your real key
+# ===============================================================
+
 # -------------------- Optional Gemini imports (lazy) --------------------
 GENAI_AVAILABLE = False
 try:
@@ -222,12 +226,12 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
-# -------------------- Gemini helpers (optional) --------------------
-def configure_gemini(api_key: str):
-    if not GENAI_AVAILABLE:
+# -------------------- Gemini helpers --------------------
+def configure_gemini():
+    if not GENAI_AVAILABLE or not API_KEY:
         return None
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=API_KEY)
         return genai.GenerativeModel("gemini-2.5-flash")
     except Exception:
         return None
@@ -243,7 +247,6 @@ LLM_SYSTEM_RULES = (
 
 def _norm_percent(v: str) -> str:
     v = (v or "").strip().replace(" ", "")
-    # ensure trailing % for plain numbers; accept ., , or ·
     if v and not v.endswith("%"):
         if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
             v += "%"
@@ -302,13 +305,11 @@ sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', val
 show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
 
 st.sidebar.markdown("---")
-use_llm = st.sidebar.checkbox("Enable Gemini 2.5 Flash for 'LLM extracted' & 'selected %'", value=False)
-api_key = st.sidebar.text_input("Gemini API Key", value="", type="password") if use_llm else ""
-model = configure_gemini(api_key) if (use_llm and api_key) else None
-if use_llm and not api_key:
-    st.sidebar.warning("Enter your Gemini API key to enable LLM columns.")
-if use_llm and api_key and model is None:
-    st.sidebar.error("Gemini client not available or API key invalid. Columns will remain empty.")
+use_llm = st.sidebar.checkbox("Enable Gemini 2.5 Flash for 'LLM extracted' & 'selected %'", value=True)
+
+model = configure_gemini() if use_llm else None
+if use_llm and model is None:
+    st.sidebar.error("Gemini not available or API key invalid. LLM columns will remain empty.")
 
 if not uploaded:
     st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
@@ -340,7 +341,6 @@ def process_df(df, text_col, model):
         # ---- HbA1c extraction (strict rules & filtering) ----
         hba_matches, hba_sentences = extract_sentences(text, re_hba1c, 'hba1c')
 
-        # STRICT FILTER for HbA1c: keep only values < 7 (prefer reduction_pp if present)
         def allowed_hba(m):
             rp = m.get('reduction_pp')
             if rp is not None and not (isinstance(rp, float) and math.isnan(rp)):
@@ -434,29 +434,11 @@ def process_df(df, text_col, model):
 
     return out
 
-if not uploaded:
-    st.stop()
-
-# read file robustly
-try:
-    if uploaded.name.lower().endswith('.csv'):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded, sheet_name=sheet_name if sheet_name else None)
-except Exception as e:
-    st.error(f'Failed to read file: {e}')
-    st.stop()
-
-if col_name not in df.columns:
-    st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
-    st.stop()
-
 out_df = process_df(df, col_name, model)
 
 # display
 st.write('### Results (first 200 rows shown)')
 display_df = out_df.copy()
-# Hide debug unless requested
 if not show_debug:
     for c in ['reductions_pp', 'reduction_types', 'weight_reductions_pp', 'weight_reduction_types']:
         if c in display_df.columns:
@@ -496,4 +478,4 @@ st.write("- 'from X% to Y%' searched across the whole sentence; shown as delta (
 st.write("- Other % patterns must be within the **previous 5 spaces** and **next 5 spaces** of the target term (including bordering tokens).")
 st.write("- HbA1c values strictly **< 7**; weight has no numeric cutoff.")
 st.write("- Row kept if **either** HbA1c **or** weight qualifies.")
-st.write("- Optional: Gemini picks `LLM extracted` and a single `selected %` per target; it **may propose a cleaned value not in regex candidates**.")
+st.write("- Gemini picks `LLM extracted` and a single `selected %` per target; it **may propose a cleaned value not in regex candidates**.")
