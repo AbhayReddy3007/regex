@@ -6,13 +6,19 @@ Row keeping rule:
 
 HbA1c rules:
 - Sentence must contain HbA1c/A1c + % + reduction cue (reduced/decreased/lowered/dropped/fell/declined or 'from ... to ...').
-- Within that sentence, extract only % values within the NEXT 4 WORDS after the HbA1c/A1c mention.
+- Within that sentence:
+    • 'from X% to Y%' is searched ACROSS THE WHOLE SENTENCE (no local window).
+    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 WORDS and NEXT 4 WORDS
+      around each HbA1c/A1c term.
 - Strict numeric filter: keep ONLY values < 7.
   * For from→to, the extracted value is (X − Y) and must also be < 7.
 
 Weight rules:
 - Sentence must contain weight term + % + reduction cue.
-- Extract only % within the NEXT 4 WORDS after the weight term.
+- Within that sentence:
+    • 'from X% to Y%' is searched ACROSS THE WHOLE SENTENCE.
+    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 WORDS and NEXT 4 WORDS
+      around each weight term.
 - (No numeric cutoff unless you ask for one.)
 """
 
@@ -24,7 +30,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c + Body Weight — % reductions within next 4 words (HbA1c strict < 7)")
+st.title("HbA1c / A1c + Body Weight — whole-sentence from→to, ±4-word window for others")
 
 # -------------------- Regex helpers --------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
@@ -70,20 +76,9 @@ def split_sentences(text: str):
     parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
     return [p.strip() for p in parts if p and p.strip()]
 
-def next_n_words_window(s: str, start: int, n: int = 4):
-    """Return (segment, abs_start, abs_end) covering the NEXT n tokens (\S+) after index 'start'."""
-    sub = s[start:]
-    end_rel, count = 0, 0
-    for m in re.finditer(r'\S+', sub):
-        end_rel = m.end()
-        count += 1
-        if count >= n:
-            break
-    if count == 0:
-        return '', start, start
-    abs_start = start
-    abs_end = start + end_rel
-    return s[abs_start:abs_end], abs_start, abs_end
+def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
+    """Require: (target term) AND a % AND a reduction cue."""
+    return bool(term_re.search(sent)) and bool(re_pct.search(sent)) and bool(re_reduction_cue.search(sent))
 
 def fmt_pct(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -91,58 +86,78 @@ def fmt_pct(v):
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
-# -------------------- Core extractors (generic over a target term regex) --------------------
-def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
-    """Require: (target term) AND a % AND a reduction cue."""
-    return bool(term_re.search(sent)) and bool(re_pct.search(sent)) and bool(re_reduction_cue.search(sent))
+# --- build a local window of previous N words and next N words around index 'pos' ---
+def window_prev_next_words(s: str, pos: int, n_prev: int = 4, n_next: int = 4):
+    """
+    Return (segment, abs_start, abs_end) covering the PREVIOUS n_prev tokens that END <= pos
+    and the NEXT n_next tokens that START >= pos. Tokens are runs of non-space (\S+).
+    """
+    tokens = [(m.start(), m.end()) for m in re.finditer(r'\S+', s)]
+    # previous tokens: those ending at/before pos
+    prev = [span for span in tokens if span[1] <= pos]
+    left_spans = prev[-n_prev:] if prev else []
+    left_start = left_spans[0][0] if left_spans else pos
 
-def add_match(out, si, seg_abs_start, m, typ, values, reduction):
+    # next tokens: those starting at/after pos
+    nxt = [span for span in tokens if span[0] >= pos]
+    right_spans = nxt[:n_next] if nxt else []
+    right_end = right_spans[-1][1] if right_spans else pos
+
+    abs_start = max(0, left_start)
+    abs_end = min(len(s), right_end)
+    if abs_end < abs_start:
+        abs_end = abs_start
+    return s[abs_start:abs_end], abs_start, abs_end
+
+def add_match(out, si, abs_start, m, typ, values, reduction):
     out.append({
         'raw': m.group(0),
         'type': typ,
         'values': values,
         'reduction_pp': reduction,
         'sentence_index': si,
-        'span': (seg_abs_start + m.start(), seg_abs_start + m.end()),
+        'span': (abs_start + m.start(), abs_start + m.end()),
     })
 
-def extract_next4_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
+# -------------------- Core extraction --------------------
+def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
     """
-    Within a sentence, for each target term occurrence (HbA1c or weight),
-    search only the next-4-words window for percent patterns.
+    Within a qualifying sentence:
+      • Scan the WHOLE SENTENCE for 'from X% to Y%' and record deltas.
+      • For all other % patterns, search ONLY within a ±4-word window around each term occurrence.
     """
     matches = []
-    for hh in term_re.finditer(sent):
-        seg, abs_s, _ = next_n_words_window(sent, hh.end(), 4)
-        if not seg:
-            continue
 
-        # from X% to Y%  -> X - Y (pp)
-        for m in re_fromto.finditer(seg):
-            a = parse_number(m.group(1)); b = parse_number(m.group(2))
-            red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:from-to_next4', [a, b], red)
+    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp)
+    for m in re_fromto.finditer(sent):
+        a = parse_number(m.group(1)); b = parse_number(m.group(2))
+        red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
+        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
+
+    # 2) ±4-word window around each target term: other patterns only
+    for hh in term_re.finditer(sent):
+        seg, abs_s, _ = window_prev_next_words(sent, hh.end(), 4, 4)
 
         # reduced/decreased/... by X%
         for m in re_reduce_by.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_or_pp_next4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_or_pp_pm4', [v], v)
 
         # reduction of X%
         for m in re_abs_pp.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:pp_word_next4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:pp_word_pm4', [v], v)
 
         # ranges like 1.0–1.5% (represent as max)
         for m in re_range.finditer(seg):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             rep = None if (math.isnan(a) or math.isnan(b)) else max(a, b)
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:range_percent_next4', [a, b], rep)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:range_percent_pm4', [a, b], rep)
 
         # any stray percent in the window
         for m in re_pct.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_next4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pm4', [v], v)
 
     # de-dupe by span
     seen = set()
@@ -155,14 +170,14 @@ def extract_next4_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefi
     uniq.sort(key=lambda x: x['span'][0])
     return uniq
 
-def extract_sentences_next4(text: str, term_re: re.Pattern, tag_prefix: str):
-    """Return (matches, sentences_used) for sentences meeting the criterion, using next-4-words windows."""
+def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
+    """Return (matches, sentences_used) for sentences meeting the criterion, mixed-scope logic."""
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent, term_re):
             continue
         sentences_used.append(sent)
-        matches.extend(extract_next4_in_sentence(sent, si, term_re, tag_prefix))
+        matches.extend(extract_in_sentence(sent, si, term_re, tag_prefix))
 
     # dedupe globally by (sentence_index, span)
     seen, filtered = set(), []
@@ -211,7 +226,7 @@ def process_df(df, text_col):
         text = '' if not isinstance(text, str) else text
 
         # ---- HbA1c extraction (strict rules & filtering) ----
-        hba_matches, hba_sentences = extract_sentences_next4(text, re_hba1c, 'hba1c')
+        hba_matches, hba_sentences = extract_sentences(text, re_hba1c, 'hba1c')
 
         # STRICT FILTER for HbA1c: keep only values < 7 (prefer reduction_pp if present)
         def allowed_hba(m):
@@ -236,7 +251,7 @@ def process_df(df, text_col):
             return m.get('raw', '')
 
         # ---- Weight extraction (no strict numeric threshold by default) ----
-        wt_matches, wt_sentences = extract_sentences_next4(text, re_weight, 'weight')
+        wt_matches, wt_sentences = extract_sentences(text, re_weight, 'weight')
 
         def fmt_extracted_wt(m):
             t = (m.get('type') or '').lower()
@@ -325,7 +340,8 @@ st.download_button(
 )
 
 st.markdown('---')
-st.write('**Rules enforced:**')
-st.write('- HbA1c: sentence must contain HbA1c/A1c + % + reduction cue; only % within the NEXT 4 words after the term; strict **< 7** (delta for from→to).')
-st.write('- Weight: sentence must contain weight term + % + reduction cue; only % within the NEXT 4 words after the term.')
-st.write('- **Row is kept if either HbA1c qualifies OR weight qualifies** (weight-only rows are allowed).')
+st.write("**Rules enforced:**")
+st.write("- 'from X% to Y%' searched across the whole sentence; shown as delta (X−Y).")
+st.write("- Other % patterns must be within the **previous 4** and **next 4 words** of the target term.")
+st.write("- HbA1c values strictly **< 7**; weight has no numeric cutoff.")
+st.write("- Row kept if **either** HbA1c **or** weight qualifies.")
