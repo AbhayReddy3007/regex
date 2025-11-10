@@ -8,7 +8,7 @@ HbA1c rules:
 - Sentence must contain HbA1c/A1c + % + reduction cue (reduced/decreased/lowered/dropped/fell/declined or 'from ... to ...').
 - Within that sentence:
     • 'from X% to Y%' is searched ACROSS THE WHOLE SENTENCE (no local window).
-    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 WORDS and NEXT 4 WORDS
+    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 SPACES and NEXT 4 SPACES
       around each HbA1c/A1c term.
 - Strict numeric filter: keep ONLY values < 7.
   * For from→to, the extracted value is (X − Y) and must also be < 7.
@@ -17,7 +17,7 @@ Weight rules:
 - Sentence must contain weight term + % + reduction cue.
 - Within that sentence:
     • 'from X% to Y%' is searched ACROSS THE WHOLE SENTENCE.
-    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 WORDS and NEXT 4 WORDS
+    • All other % patterns are searched in a LOCAL WINDOW spanning the PREVIOUS 4 SPACES and NEXT 4 SPACES
       around each weight term.
 - (No numeric cutoff unless you ask for one.)
 """
@@ -30,7 +30,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c + Body Weight — whole-sentence from→to, ±4-word window for others")
+st.title("HbA1c / A1c + Body Weight — whole-sentence from→to, ±4 spaces window for others")
 
 # -------------------- Regex helpers --------------------
 NUM = r'(?:\d+(?:[.,]\d+)?)'
@@ -86,28 +86,49 @@ def fmt_pct(v):
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
-# --- build a local window of previous N words and next N words around index 'pos' ---
-def window_prev_next_words(s: str, pos: int, n_prev: int = 4, n_next: int = 4):
+# --- build a local window by counting spaces to left/right of a position ---
+def window_prev_next_spaces(s: str, pos: int, n_prev_spaces: int = 4, n_next_spaces: int = 4):
     """
-    Return (segment, abs_start, abs_end) covering the PREVIOUS n_prev tokens that END <= pos
-    and the NEXT n_next tokens that START >= pos. Tokens are runs of non-space (\S+).
+    Return (segment, abs_start, abs_end) covering text spanning:
+      - up to the PREVIOUS n_prev_spaces space characters to the left of 'pos', and
+      - up to the NEXT n_next_spaces space characters to the right of 'pos'.
+
+    This is literal space-counting. Newlines are treated as spaces for counting.
     """
-    tokens = [(m.start(), m.end()) for m in re.finditer(r'\S+', s)]
-    # previous tokens: those ending at/before pos
-    prev = [span for span in tokens if span[1] <= pos]
-    left_spans = prev[-n_prev:] if prev else []
-    left_start = left_spans[0][0] if left_spans else pos
-
-    # next tokens: those starting at/after pos
-    nxt = [span for span in tokens if span[0] >= pos]
-    right_spans = nxt[:n_next] if nxt else []
-    right_end = right_spans[-1][1] if right_spans else pos
-
-    abs_start = max(0, left_start)
-    abs_end = min(len(s), right_end)
-    if abs_end < abs_start:
-        abs_end = abs_start
-    return s[abs_start:abs_end], abs_start, abs_end
+    # Normalize newlines to spaces for counting without destroying original indices
+    # We'll scan left/right counting ' ' and '\t' and '\n' as space-like.
+    space_like = set([' ', '\t', '\n', '\r'])
+    # Left
+    spaces = 0
+    start = pos
+    i = pos - 1
+    while i >= 0 and spaces < n_prev_spaces:
+        if s[i] in space_like:
+            spaces += 1
+            # skip contiguous whitespace as a single boundary
+            while i >= 0 and s[i] in space_like:
+                i -= 1
+            # we stopped on non-space or -1; set start to next char after run
+            start = i + 1
+        else:
+            i -= 1
+    # Right
+    spaces = 0
+    end = pos
+    j = pos
+    L = len(s)
+    while j < L and spaces < n_next_spaces:
+        if s[j] in space_like:
+            spaces += 1
+            while j < L and s[j] in space_like:
+                j += 1
+            end = j  # first non-space after this whitespace run
+        else:
+            j += 1
+    # Clamp
+    start = max(0, min(start, len(s)))
+    end = max(start, min(end if end != pos else len(s), len(s)))
+    return s[start:end], start, end
 
 def add_match(out, si, abs_start, m, typ, values, reduction):
     out.append({
@@ -124,7 +145,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     """
     Within a qualifying sentence:
       • Scan the WHOLE SENTENCE for 'from X% to Y%' and record deltas.
-      • For all other % patterns, search ONLY within a ±4-word window around each term occurrence.
+      • For all other % patterns, search ONLY within a ±4-SPACES window around each term occurrence.
     """
     matches = []
 
@@ -134,30 +155,30 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
         red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
 
-    # 2) ±4-word window around each target term: other patterns only
+    # 2) ±4-SPACES window around each target term: other patterns only
     for hh in term_re.finditer(sent):
-        seg, abs_s, _ = window_prev_next_words(sent, hh.end(), 4, 4)
+        seg, abs_s, _ = window_prev_next_spaces(sent, hh.end(), 4, 4)
 
         # reduced/decreased/... by X%
         for m in re_reduce_by.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_or_pp_pm4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_or_pp_pmSpaces4', [v], v)
 
         # reduction of X%
         for m in re_abs_pp.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:pp_word_pm4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:pp_word_pmSpaces4', [v], v)
 
         # ranges like 1.0–1.5% (represent as max)
         for m in re_range.finditer(seg):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             rep = None if (math.isnan(a) or math.isnan(b)) else max(a, b)
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:range_percent_pm4', [a, b], rep)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:range_percent_pmSpaces4', [a, b], rep)
 
         # any stray percent in the window
         for m in re_pct.finditer(seg):
             v = parse_number(m.group(1))
-            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pm4', [v], v)
+            add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pmSpaces4', [v], v)
 
     # de-dupe by span
     seen = set()
@@ -171,7 +192,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     return uniq
 
 def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
-    """Return (matches, sentences_used) for sentences meeting the criterion, mixed-scope logic."""
+    """Return (matches, sentences_used) for sentences meeting the criterion."""
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent, term_re):
@@ -342,6 +363,6 @@ st.download_button(
 st.markdown('---')
 st.write("**Rules enforced:**")
 st.write("- 'from X% to Y%' searched across the whole sentence; shown as delta (X−Y).")
-st.write("- Other % patterns must be within the **previous 4** and **next 4 words** of the target term.")
+st.write("- Other % patterns must be within the **previous 4 spaces** and **next 4 spaces** of the target term.")
 st.write("- HbA1c values strictly **< 7**; weight has no numeric cutoff.")
 st.write("- Row kept if **either** HbA1c **or** weight qualifies.")
