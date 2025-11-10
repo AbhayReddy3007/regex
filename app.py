@@ -44,18 +44,39 @@ def parse_number(s: str) -> float:
     s = s.replace(',', '.').strip()
     try:
         return float(s)
-    except:
+    except Exception:
         return float('nan')
+
+
+def _next_n_words_window_fallback(s: str, start: int, n: int = 4):
+    """
+    Return substring spanning the next n non-space tokens after position start,
+    and its absolute [start, end) span in the original string.
+    """
+    sub = s[start:]
+    end_rel = 0
+    count = 0
+    for _m in re.finditer(r'\S+', sub):
+        end_rel = _m.end()
+        count += 1
+        if count >= n:
+            break
+    if count == 0:
+        return '', start, start
+    abs_start = start
+    abs_end = start + end_rel
+    return s[abs_start:abs_end], abs_start, abs_end
 
 
 def extract_hba1c_reductions(text: str):
     """
     Prefer matches that occur on the *same line* as an HbA1c/A1c mention.
-    If no such same-line matches are found, fall back to the previous wider search
-    but mark those matches as `..._fallback` so you can filter them out if desired.
+    If no such same-line matches are found, fall back to a broader search
+    and mark those types with `_fallback`.
     """
     if not isinstance(text, str):
         return []
+
     matches = []
     t = text
 
@@ -72,28 +93,57 @@ def extract_hba1c_reductions(text: str):
                 reduction = None
                 if not math.isnan(a) and not math.isnan(b):
                     reduction = a - b
-                matches.append({'raw': m.group(0), 'type': 'from-to_same_line', 'values': [a, b], 'reduction_pp': reduction, 'span': (li, m.span())})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'from-to_same_line',
+                    'values': [a, b],
+                    'reduction_pp': reduction,
+                    'span': (li, m.span())
+                })
 
             for m in re_reduce_by.finditer(line):
                 v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'percent_or_pp_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'percent_or_pp_same_line',
+                    'values': [v],
+                    'reduction_pp': v,
+                    'span': (li, m.span())
+                })
 
             for m in re_abs_pp.finditer(line):
                 v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'pp_word_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'pp_word_same_line',
+                    'values': [v],
+                    'reduction_pp': v,
+                    'span': (li, m.span())
+                })
 
             for m in re_range.finditer(line):
                 a = parse_number(m.group(1))
                 b = parse_number(m.group(2))
-                matches.append({'raw': m.group(0), 'type': 'range_percent_same_line', 'values': [a, b], 'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None, 'span': (li, m.span())})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'range_percent_same_line',
+                    'values': [a, b],
+                    'reduction_pp': max(a, b) if not math.isnan(a) and not math.isnan(b) else None,
+                    'span': (li, m.span())
+                })
 
             for m in re_pct.finditer(line):
                 v = parse_number(m.group(1))
-                matches.append({'raw': m.group(0), 'type': 'percent_same_line', 'values': [v], 'reduction_pp': v, 'span': (li, m.span())})
+                matches.append({
+                    'raw': m.group(0),
+                    'type': 'percent_same_line',
+                    'values': [v],
+                    'reduction_pp': v,
+                    'span': (li, m.span())
+                })
 
     # If we found same-line matches, return those (deduped)
     if matches:
-        # dedupe by (line, span)
         seen = set()
         filtered = []
         for mm in matches:
@@ -104,9 +154,7 @@ def extract_hba1c_reductions(text: str):
             filtered.append(mm)
         return filtered
 
-    # --- 2) fallback: no same-line matches found, run the broader search (previous behavior)
-    # We append "_fallback" to the type so you can filter these out if you want to keep only same-line hits.
-
+    # --- 2) fallback: no same-line matches found, run the broader search ---
     # from X% to Y%  -> compute X - Y
     for m in re_fromto.finditer(t):
         a = parse_number(m.group(1))
@@ -157,38 +205,22 @@ def extract_hba1c_reductions(text: str):
         })
 
     # percent tokens: keep ONLY those that occur within the NEXT 4 WORDS after an HbA1c/A1c mention
-# helper to compute a window spanning the next 4 tokens (\S+)
-def _next_n_words_window_fallback(s: str, start: int, n: int = 4):
-    sub = s[start:]
-    end_rel = 0
-    count = 0
-    for _m in re.finditer(r'\S+', sub):
-        end_rel = _m.end()
-        count += 1
-        if count >= n:
-            break
-    if count == 0:
-        return '', start, start
-    abs_start = start
-    abs_end = start + end_rel
-    return s[abs_start:abs_end], abs_start, abs_end
+    hba_words = list(re_hba.finditer(t))
+    for hh in hba_words:
+        seg, abs_s, abs_e = _next_n_words_window_fallback(t, hh.end(), 4)
+        if not seg:
+            continue
+        for m in re_pct.finditer(seg):
+            val = parse_number(m.group(1))
+            matches.append({
+                'raw': m.group(0),
+                'type': 'percent_next4_fallback',
+                'values': [val],
+                'reduction_pp': val,
+                'span': (abs_s + m.start(), abs_s + m.end())
+            })
 
-hba_words = list(re_hba.finditer(t))
-for hh in hba_words:
-    seg, abs_s, abs_e = _next_n_words_window_fallback(t, hh.end(), 4)
-    if not seg:
-        continue
-    for m in re_pct.finditer(seg):
-        val = parse_number(m.group(1))
-        matches.append({
-            'raw': m.group(0),
-            'type': 'percent_next4_fallback',
-            'values': [val],
-            'reduction_pp': val,
-            'span': (abs_s + m.start(), abs_s + m.end())
-        })
-
-# dedupe by span (original behavior)
+    # dedupe by span and sort
     seen_spans = set()
     filtered = []
     for mm in matches:
@@ -198,7 +230,17 @@ for hh in hba_words:
         seen_spans.add(sp)
         filtered.append(mm)
 
-    filtered.sort(key=lambda x: x['span'][0] if isinstance(x['span'][0], int) else x['span'][0])
+    # spans are either (line_index, (start,end)) or (start,end); normalize key
+    def _span_start_key(sp):
+        if isinstance(sp[0], tuple):  # shouldn't happen here
+            return sp[0][0]
+        if isinstance(sp[0], int) and isinstance(sp[1], tuple):
+            return (sp[0], sp[1][0])
+        if isinstance(sp[0], int) and isinstance(sp[1], int):
+            return sp[0]
+        return 0
+
+    filtered.sort(key=lambda x: _span_start_key(x['span']))
     return filtered
 
 
@@ -240,17 +282,17 @@ def process_df(df, text_col):
     for idx, row in df.iterrows():
         text = row.get(text_col, '')
         matches = extract_hba1c_reductions(text)
-        # Keep ONLY matches that explicitly contain a % sign and are not global (must be associated with HbA1c/A1c context)
+
+        # Keep ONLY matches that explicitly contain a % sign and are not global
         matches = [m for m in matches if '%' in m.get('raw', '') and 'global' not in m.get('type', '')]
 
         # Additional rule:
         # - Keep numbers < 7
-        # - Allow numbers >= 7 ONLY if it's an explicit from-to reduction (e.g., "from 9.1% to 7.8%")
+        # - Allow >= 7 ONLY if it's an explicit from-to reduction (e.g., "from 9.1% to 7.8%")
         def _allowed(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:  # allow explicit from-to phrases regardless of value
                 return True
-            # Otherwise, any numeric value < 7 passes
             vals = m.get('values') or []
             for v in vals:
                 try:
@@ -258,7 +300,6 @@ def process_df(df, text_col):
                         return True
                 except Exception:
                     pass
-            # Also permit if computed reduction_pp < 7 (for safety)
             rp = m.get('reduction_pp')
             try:
                 if rp is not None and not (isinstance(rp, float) and math.isnan(rp)) and float(rp) < 7.0:
@@ -295,7 +336,7 @@ if not show_raw:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
 
-st.dataframe(display_df.head(200))
+st.dataframe(display_df.head(200), use_container_width=True)
 
 # allow download
 @st.cache_data
@@ -308,7 +349,12 @@ def to_excel_bytes(df):
 
 excel_bytes = to_excel_bytes(out_df)
 
-st.download_button('Download results as Excel', data=excel_bytes, file_name='results_with_hba1c.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+st.download_button(
+    'Download results as Excel',
+    data=excel_bytes,
+    file_name='results_with_hba1c.xlsx',
+    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+)
 
 st.markdown('---')
 st.write('**Notes:**')
