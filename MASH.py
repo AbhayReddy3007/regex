@@ -1,5 +1,5 @@
 # app.py
-# Streamlit app: Upload file -> 'sentences' (MASH + resolution) -> 'extracted values' (numbers within ±5 words of MASH/resolution) -> drop empty -> download
+# Streamlit app: Upload file -> 'sentences' (MASH + resolution) -> 'extracted values' (ONLY % numbers within ±5 words of MASH/resolution) -> drop empty -> download
 
 import io
 import re
@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="MASH Resolution Extractor", layout="wide")
-st.title("MASH + Resolution Sentence & Windowed Number Extractor")
+st.title("MASH + Resolution Sentence & % Number Extractor (±5 words)")
 st.caption("Upload an Excel (.xlsx) or CSV with an **abstracts** column.")
 
 uploaded = st.file_uploader("Upload file", type=["xlsx", "csv"])
@@ -34,20 +34,17 @@ def build_sentences_column(series: pd.Series) -> pd.Series:
     return filtered.apply(lambda lst: SENT_JOINER.join(lst))
 
 def _strip_punct(word: str) -> str:
-    # remove leading/trailing punctuation for keyword matching
     return re.sub(r'^\W+|\W+$', '', word or '')
 
-def _window_numbers_from_sentence(sentence: str, window: int = WINDOW):
+def _window_percent_numbers_from_sentence(sentence: str, window: int = WINDOW):
     """
-    Return numbers within ±window words of any occurrence of 'MASH' or 'resolution'.
-    Keeps percent if present (e.g., 12% or '12 %').
-    Handles 1,234.56 formats.
+    Return ONLY percent numbers within ±window words of any 'MASH' or 'resolution'.
+    Accepts '12%', '12 %', '1,234.5 %', outputs canonical '12%' (no space).
     """
     if not isinstance(sentence, str) or not sentence.strip():
         return []
 
     tokens = sentence.split()
-    # indices of anchor tokens (case-insensitive, ignoring surrounding punctuation)
     anchor_idxs = [
         i for i, tok in enumerate(tokens)
         if _strip_punct(tok).lower() in KEYWORDS
@@ -56,36 +53,29 @@ def _window_numbers_from_sentence(sentence: str, window: int = WINDOW):
         return []
 
     hits, seen = [], set()
-
-    # pattern: number with optional decimals and thousands; optional % (possibly spaced)
-    # We'll scan window text, then normalize commas; keep % if present.
-    num_re = re.compile(r'((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*%)?')
+    # Require a percent sign (optionally spaced): group(2) exists and includes any spaces before %
+    num_pct_re = re.compile(r'((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(\s*%)')  # % is REQUIRED
 
     for i in anchor_idxs:
         start = max(0, i - window)
         end = min(len(tokens), i + window + 1)
         window_text = " ".join(tokens[start:end])
 
-        for m in num_re.finditer(window_text):
+        for m in num_pct_re.finditer(window_text):
             num = m.group(1).replace(',', '')
-            has_pct = bool(m.group(2))
-            val = num + ('%' if has_pct else '')
-            if val and val not in seen:
+            val = num + '%'
+            if val not in seen:
                 seen.add(val)
                 hits.append(val)
 
     return hits
 
-def extract_windowed_numbers_from_sentences_field(sentences_field: str):
-    """
-    The 'sentences' column may contain multiple sentences joined by SENT_JOINER.
-    We apply the windowed extractor per sentence and de-duplicate while preserving order.
-    """
+def extract_windowed_percent_from_sentences_field(sentences_field: str):
     if not isinstance(sentences_field, str) or not sentences_field.strip():
         return []
     all_vals, seen = [], set()
     for sent in sentences_field.split(SENT_JOINER):
-        vals = _window_numbers_from_sentence(sent)
+        vals = _window_percent_numbers_from_sentence(sent)
         for v in vals:
             if v not in seen:
                 seen.add(v)
@@ -111,15 +101,14 @@ else:
             st.error("The file must contain a column named **abstracts**.")
             st.stop()
 
-        # Ensure text type to avoid issues
         df['abstracts'] = df['abstracts'].astype(str)
 
         # 1) sentences column (must contain BOTH 'MASH' and 'resolution')
         df['sentences'] = build_sentences_column(df['abstracts'])
 
-        # 2) extracted values column (only numbers within ±5 words of MASH/resolution)
+        # 2) extracted values: ONLY % numbers within ±5 words of anchors
         df['extracted values'] = df['sentences'].apply(
-            lambda s: ", ".join(extract_windowed_numbers_from_sentences_field(s)) if isinstance(s, str) else ""
+            lambda s: ", ".join(extract_windowed_percent_from_sentences_field(s)) if isinstance(s, str) else ""
         )
 
         # 3) drop rows where 'sentences' is empty
@@ -134,7 +123,7 @@ else:
             st.warning(
                 "No rows left after filtering. "
                 "Either there are no sentences containing both 'MASH' and 'resolution', "
-                "or there are no numbers within ±5 words of those keywords."
+                "or there are no percent values within ±5 words of those keywords."
             )
         else:
             st.success(f"Processed {len(df_out)} rows.")
