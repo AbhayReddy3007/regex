@@ -1,5 +1,4 @@
 # app.py
-import os
 import re
 import math
 import json
@@ -8,9 +7,11 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-# -------------------- Model config (Gemini 2.0 Flash) --------------------
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+# ===================== HARD-CODED GEMINI KEY (SET THIS) =====================
+API_KEY = "YOUR_GEMINI_KEY"   # <-- replace with your actual Gemini 2.0 Flash API key
+# ===========================================================================
 
+# Optional Gemini import (app still runs if package missing)
 GENAI_AVAILABLE = False
 try:
     import google.generativeai as genai
@@ -18,30 +19,13 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
-def configure_gemini_from_env():
-    """
-    Configure Gemini with GEMINI_API_KEY environment variable.
-    Returns a GenerativeModel or None if not configured.
-    """
-    if not GENAI_AVAILABLE:
-        return None
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel(GEMINI_MODEL_NAME)
-    except Exception:
-        return None
-
-# -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c + Body Weight — whole-sentence from→to, ±5-spaces window + Gemini 2.0 Flash on sentence columns")
+st.title("HbA1c / A1c + Body Weight — whole-sentence from→to, ±5-spaces window for others + LLM (Gemini 2.0 Flash)")
 
-# -------------------- Regex helpers (unchanged core) --------------------
+# -------------------- Regex helpers --------------------
 NUM = r'(?:[+-]?\d+(?:[.,·]\d+)?)'
 PCT = rf'({NUM})\s*%'
-DASH = r'(?:-|–|—)'
+DASH = r'(?:-|–|—)'  # '-', en dash, em dash
 
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
 REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
@@ -91,7 +75,7 @@ def fmt_pct(v):
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
-# --- window by counting spaces (inclusive of bordering tokens) ---
+# --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
     L = len(s)
@@ -130,6 +114,7 @@ def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: in
         m += 1
     end = m
 
+    # Clamp
     start = max(0, min(start, L))
     end = max(start, min(end if end != pos else L, L))
     return s[start:end], start, end
@@ -146,15 +131,22 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
 
 # -------------------- Core extraction --------------------
 def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
+    """
+    Within a qualifying sentence:
+      • Scan the WHOLE SENTENCE for 'from X% to Y%' and record deltas.
+      • For all other % patterns, search ONLY within a ±5-SPACES (inclusive-token) window
+        around each term occurrence.
+      • EXTRA (weight only): If window yields nothing, capture the NEAREST PREVIOUS % within 60 chars.
+    """
     matches = []
 
-    # 1) whole-sentence from X% to Y% -> delta
+    # whole-sentence: from X% to Y% -> delta
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
         red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
 
-    # 2) window ±5 spaces for other patterns
+    # ±5-spaces window
     any_window_hit = False
     for hh in term_re.finditer(sent):
         seg, abs_s, _ = window_prev_next_spaces_inclusive_tokens(sent, hh.end(), 5, 5)
@@ -180,7 +172,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
             v = parse_number(m.group(1))
             add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pmSpaces5', [v], v)
 
-    # 3) weight safety: nearest previous % within 60 chars if window empty
+    # weight fallback: nearest previous % within 60 chars
     if (tag_prefix == 'weight') and (not any_window_hit):
         for hh in term_re.finditer(sent):
             pos = hh.start()
@@ -194,7 +186,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 v = parse_number(last_pct.group(1))
                 add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
 
-    # dedupe by span
+    # de-dupe
     seen = set()
     uniq = []
     for mm in matches:
@@ -206,6 +198,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     return uniq
 
 def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
+    """Return (matches, sentences_used) for sentences meeting the criterion."""
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent, term_re):
@@ -213,6 +206,7 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
         sentences_used.append(sent)
         matches.extend(extract_in_sentence(sent, si, term_re, tag_prefix))
 
+    # dedupe globally
     seen, filtered = set(), []
     for mm in matches:
         key = (mm['sentence_index'], mm['span'])
@@ -224,7 +218,70 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
-# -------------------- UI inputs --------------------
+# -------------------- Gemini 2.0 Flash helpers --------------------
+def configure_gemini():
+    if not GENAI_AVAILABLE or not API_KEY:
+        return None
+    try:
+        genai.configure(api_key=API_KEY)
+        return genai.GenerativeModel("gemini-2.0-flash")
+    except Exception:
+        return None
+
+LLM_SYSTEM_RULES = (
+    "Extract ONLY HbA1c/A1c or body weight percentage changes from the provided sentences.\n"
+    "- Prefer 'from X% to Y%' deltas as X - Y (percentage points).\n"
+    "- You MAY propose a cleaned/normalized value even if it does NOT appear in the regex candidates.\n"
+    "- Output strictly JSON with keys: extracted (array like ['1.2%']), selected_percent (string like '1.2%').\n"
+    "- No commentary."
+)
+
+def _norm_percent(v: str) -> str:
+    v = (v or "").strip().replace(" ", "")
+    if v and not v.endswith("%"):
+        if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
+            v += "%"
+    return v
+
+def llm_choose_best(model, target_label: str, sentences_text: str, regex_candidates: list):
+    """
+    sentences_text: a single string (already the concatenated 'sentence' column)
+    """
+    if model is None or not sentences_text:
+        # fallback to regex candidates
+        rc_norm = [_norm_percent(x) for x in (regex_candidates or [])]
+        return rc_norm, (rc_norm[0] if rc_norm else "")
+
+    joined_cand = "\n".join(f"- {c}" for c in (regex_candidates or []))
+    prompt = f"""Role: {target_label} percentage change extractor.
+
+{LLM_SYSTEM_RULES}
+
+Sentences:
+{sentences_text}
+
+Regex candidates (HINTS only — you may output other cleaned values):
+{joined_cand if joined_cand else '- (none)'}
+
+Return JSON only. Example:
+{{"extracted": ["1.3%","0.8%"], "selected_percent": "1.3%"}}
+"""
+    try:
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", "") or "").strip()
+        s = text.find("{"); e = text.rfind("}")
+        if s != -1 and e > s:
+            data = json.loads(text[s:e+1])
+            extracted = [_norm_percent(x) for x in data.get("extracted", []) if isinstance(x, str)]
+            selected = _norm_percent(data.get("selected_percent", ""))
+            return extracted, selected
+    except Exception:
+        pass
+
+    rc_norm = [_norm_percent(x) for x in (regex_candidates or [])]
+    return rc_norm, (rc_norm[0] if rc_norm else "")
+
+# -------------------- UI --------------------
 st.sidebar.header('Options')
 uploaded   = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
 col_name   = st.sidebar.text_input('Column with abstracts/text', value='abstract')
@@ -232,7 +289,7 @@ sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', val
 show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
 
 if not uploaded:
-    st.info('Upload your Excel or CSV file in the left sidebar.')
+    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
     st.stop()
 
 # read file robustly
@@ -251,18 +308,18 @@ if col_name not in df.columns:
 
 st.success(f'Loaded {len(df)} rows. Processing...')
 
-# -------------------- Phase 1: regex pipeline (creates sentence columns) --------------------
+# -------------------- Regex pass (unchanged logic) --------------------
 @st.cache_data
-def process_regex(df, text_col):
+def regex_pass(df, text_col):
     rows = []
     for _, row in df.iterrows():
         text = row.get(text_col, '')
         text = '' if not isinstance(text, str) else text
 
-        # HbA1c extraction
+        # HbA1c
         hba_matches, hba_sentences = extract_sentences(text, re_hba1c, 'hba1c')
 
-        # strict filter HbA1c: keep only < 7 (prefer reduction_pp)
+        # STRICT FILTER HbA1c: keep only < 7 (prefer reduction_pp if present)
         def allowed_hba(m):
             rp = m.get('reduction_pp')
             if rp is not None and not (isinstance(rp, float) and math.isnan(rp)):
@@ -274,7 +331,6 @@ def process_regex(df, text_col):
                 except Exception:
                     pass
             return False
-
         hba_matches = [m for m in hba_matches if allowed_hba(m)]
 
         def fmt_extracted_hba(m):
@@ -283,7 +339,7 @@ def process_regex(df, text_col):
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
-        # Weight extraction
+        # Weight
         wt_matches, wt_sentences = extract_sentences(text, re_weight, 'weight')
 
         def fmt_extracted_wt(m):
@@ -293,13 +349,15 @@ def process_regex(df, text_col):
             return m.get('raw', '')
 
         new = row.to_dict()
+        # HbA1c columns
         new.update({
-            # HbA1c
             'sentence': ' | '.join(hba_sentences) if hba_sentences else '',
             'extracted_matches': [fmt_extracted_hba(m) for m in hba_matches],
             'reductions_pp': [m.get('reduction_pp') for m in hba_matches],
             'reduction_types': [m.get('type') for m in hba_matches],
-            # Weight
+        })
+        # Weight columns
+        new.update({
             'weight_sentence': ' | '.join(wt_sentences) if wt_sentences else '',
             'weight_extracted_matches': [fmt_extracted_wt(m) for m in wt_matches],
             'weight_reductions_pp': [m.get('reduction_pp') for m in wt_matches],
@@ -309,15 +367,17 @@ def process_regex(df, text_col):
 
     out = pd.DataFrame(rows)
 
-    # keep if either HbA1c or Weight qualifies (has non-empty extracted list and sentences)
+    # keep if HbA1c OR weight qualifies
     def _list_has_items(x):
         return isinstance(x, list) and len(x) > 0
 
     mask_hba = (out['sentence'].astype(str).str.len() > 0) & (out['extracted_matches'].apply(_list_has_items))
     mask_wt  = (out['weight_sentence'].astype(str).str.len() > 0) & (out['weight_extracted_matches'].apply(_list_has_items))
+
     mask_keep = mask_hba | mask_wt
     out = out[mask_keep].reset_index(drop=True)
 
+    # counts
     out.attrs['counts'] = dict(
         kept=int(mask_keep.sum()),
         total=int(len(mask_keep)),
@@ -327,124 +387,64 @@ def process_regex(df, text_col):
     )
     return out
 
-regex_df = process_regex(df, col_name)
+regex_df = regex_pass(df, col_name)
 
-# -------------------- Phase 2: LLM over the sentence columns --------------------
-def _norm_percent(v: str) -> str:
-    v = (v or "").strip().replace(" ", "")
-    if v and not v.endswith("%") and re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
-        v += "%"
-    return v
-
-LLM_SYSTEM_RULES = (
-    "You extract ONLY HbA1c/A1c or body weight percentage changes from the provided sentences.\n"
-    "- Prefer 'from X% to Y%' deltas as X - Y (percentage points).\n"
-    "- You MAY propose a cleaned/normalized value even if it does NOT appear in the hints.\n"
-    "- If multiple values are present, choose the single best value that represents the reported change.\n"
-    "- Output strictly JSON with keys: extracted (array of strings like '1.2%'), selected_percent (string like '1.2%').\n"
-    "- Do not include any commentary."
-)
-
-def llm_extract_from_sentences(model, target_label: str, sentence_text: str, hints: list[str]):
-    """
-    sentence_text: the contents of the 'sentence' (or 'weight_sentence') column (pipe-separated).
-    hints: regex hits (we pass as hints only; LLM can propose cleaned value).
-    Returns (list_extracted, selected_percent_str)
-    """
-    if model is None or (not sentence_text or not sentence_text.strip()):
-        return [], ""
-
-    sent_list = [s.strip() for s in sentence_text.split("|") if s and s.strip()]
-    joined_sent = "\n".join(f"- {s}" for s in sent_list)
-    joined_hints = "\n".join(f"- {h}" for h in (hints or []))
-
-    prompt = f"""Role: {target_label} percentage change extractor.
-
-{LLM_SYSTEM_RULES}
-
-Sentences:
-{joined_sent if joined_sent else '- (none)'}
-
-Hints (regex candidates; you may output other cleaned values if better):
-{joined_hints if joined_hints else '- (none)'}
-
-Return JSON only. Example:
-{{"extracted": ["1.3%","0.8%"], "selected_percent": "1.3%"}}
-"""
-    try:
-        resp = model.generate_content(prompt)
-        text = (getattr(resp, "text", "") or "").strip()
-        start = text.find("{"); end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            data = json.loads(text[start:end+1])
-            ext = [_norm_percent(x) for x in data.get("extracted", []) if isinstance(x, str)]
-            sel = _norm_percent(data.get("selected_percent", ""))
-            return ext, sel
-    except Exception:
-        pass
-    # fallback: just echo hints, choose first
-    hints_norm = [_norm_percent(x) for x in (hints or [])]
-    return hints_norm, (hints_norm[0] if hints_norm else "")
-
+# -------------------- LLM pass: read 'sentence' columns and fill LLM columns --------------------
 @st.cache_data
-def run_llm_over_sentences(_df: pd.DataFrame):
-    model = configure_gemini_from_env()
-    # Prepare new columns even if model is missing
-    out = _df.copy()
+def llm_pass(input_df: pd.DataFrame):
+    model = configure_gemini()
+    rows = []
+    for _, row in input_df.iterrows():
+        # HbA1c
+        sentences_text = row.get('sentence', '') or ''
+        regex_candidates = row.get('extracted_matches', []) or []
+        hba_llm_list, hba_selected = llm_choose_best(model, "HbA1c", sentences_text, regex_candidates)
 
-    # HbA1c LLM columns
-    h_llm = []
-    h_sel = []
-    # Weight LLM columns
-    w_llm = []
-    w_sel = []
+        # Weight
+        wt_sentences_text = row.get('weight_sentence', '') or ''
+        wt_regex_candidates = row.get('weight_extracted_matches', []) or []
+        wt_llm_list, wt_selected = llm_choose_best(model, "Weight", wt_sentences_text, wt_regex_candidates)
 
-    for _, r in out.iterrows():
-        ext_h, sel_h = llm_extract_from_sentences(
-            model, "HbA1c",
-            r.get("sentence", ""),
-            r.get("extracted_matches", []),
-        )
-        h_llm.append(ext_h); h_sel.append(sel_h)
+        r = row.to_dict()
 
-        ext_w, sel_w = llm_extract_from_sentences(
-            model, "Weight",
-            r.get("weight_sentence", ""),
-            r.get("weight_extracted_matches", []),
-        )
-        w_llm.append(ext_w); w_sel.append(sel_w)
+        # insert LLM columns right after regex columns
+        r['LLM extracted'] = hba_llm_list
+        r['selected %'] = hba_selected
+        r['Weight LLM extracted'] = wt_llm_list
+        r['Weight selected %'] = wt_selected
 
-    out["LLM extracted"] = h_llm
-    out["selected %"] = h_sel
-    out["Weight LLM extracted"] = w_llm
-    out["Weight selected %"] = w_sel
+        rows.append(r)
 
-    # reorder so LLM cols sit next to regex cols
+    out = pd.DataFrame(rows)
+
+    # reorder to place LLM cols adjacent to regex ones
     def insert_after(cols, after, names):
-        cols = list(cols)
-        if after in cols:
-            idx = cols.index(after)
-            for name in names[::-1]:
-                if name in cols:
-                    cols.remove(name)
-                cols.insert(idx + 1, name)
+        if after not in cols:
+            return cols
+        i = cols.index(after)
+        for name in names[::-1]:
+            if name in cols:
+                cols.remove(name)
+            cols.insert(i + 1, name)
         return cols
 
-    final_cols = list(out.columns)
-    final_cols = insert_after(final_cols, "extracted_matches", ["LLM extracted", "selected %"])
-    final_cols = insert_after(final_cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %"])
-    out = out[final_cols]
+    cols = list(out.columns)
+    cols = insert_after(cols, 'extracted_matches', ['LLM extracted', 'selected %'])
+    cols = insert_after(cols, 'weight_extracted_matches', ['Weight LLM extracted', 'Weight selected %'])
+    out = out[cols]
     return out
 
-out_df = run_llm_over_sentences(regex_df)
+out_df = llm_pass(regex_df)
 
-# -------------------- Display --------------------
+# display
 st.write('### Results (first 200 rows shown)')
 display_df = out_df.copy()
+# Hide debug unless requested
 if not show_debug:
     for c in ['reductions_pp', 'reduction_types', 'weight_reductions_pp', 'weight_reduction_types']:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
+
 st.dataframe(display_df.head(200))
 
 # counts
@@ -456,11 +456,11 @@ if counts:
         f"HbA1c-only: {counts['hba_only']}, Weight-only: {counts['wt_only']}, Both: {counts['both']}"
     )
 
-# -------------------- Download --------------------
+# download
 @st.cache_data
 def to_excel_bytes(df):
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df.to_excel(writer, index=False)
     buffer.seek(0)
     return buffer.getvalue()
@@ -469,12 +469,6 @@ excel_bytes = to_excel_bytes(out_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_with_hba1c_weight_llm.xlsx',
+    file_name='results_with_hba1c_and_weight_llm.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
-
-# -------------------- Helpful diagnostics --------------------
-if not GENAI_AVAILABLE:
-    st.warning("google-generativeai not installed. Install with: pip install google-generativeai")
-elif not os.environ.get("GEMINI_API_KEY"):
-    st.warning("GEMINI_API_KEY is not set. LLM columns will use regex hints only. See instructions at the top.")
