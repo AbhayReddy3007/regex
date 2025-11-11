@@ -1,1 +1,1 @@
-When adjusted for age and BMI, body weight and HbA1c reduction were not significantly different between the two formulations, as the proportion of patients achieving the composite outcome of weight loss ≥ 5% and HbA1c < 7.0%.
+Coprimary endpoints, measured in all randomly assigned participants by intention to treat, were percentage bodyweight change and the proportion of participants reaching ≥5% bodyweight reduction.
