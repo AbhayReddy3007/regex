@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = ""   # <- replace with your real key
+API_KEY = ""   # <- REPLACE with your Gemini API key (gemini-2.0-flash)
 # =========================================================================
 
 # Lazy Gemini import so the app still runs without it
@@ -66,11 +66,19 @@ def split_sentences(text: str):
 def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
     return bool(term_re.search(sent)) and bool(re_pct.search(sent)) and bool(re_reduction_cue.search(sent))
 
-def fmt_pct(v):
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+def fmt_pct_val(v):
+    # return normalized percent string like '1.2%' or '' if invalid
+    if v is None:
         return ''
-    s = f"{float(v):.3f}".rstrip('0').rstrip('.')
-    return f"{s}%"
+    try:
+        if isinstance(v, str) and v.endswith('%'):
+            v = v[:-1]
+        f = float(v)
+        # strip trailing zeros
+        s = f"{abs(f):.3f}".rstrip('0').rstrip('.')
+        return f"{s}%"
+    except Exception:
+        return ''
 
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
@@ -204,10 +212,12 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
-# -------------------- UI (your original up to DataFrame) --------------------
+# -------------------- UI (file & column selection) --------------------
 st.sidebar.header('Options')
 uploaded   = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
-col_name   = st.sidebar.text_input('Column with abstracts/text', value='abstract')
+# let user pick column if multiple columns present
+example_default_col = 'abstract'
+col_name_input = st.sidebar.text_input('Column with abstracts/text (leave blank to choose)', value='')
 sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
 show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
 
@@ -215,6 +225,7 @@ if not uploaded:
     st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
     st.stop()
 
+# read file robustly
 try:
     if uploaded.name.lower().endswith('.csv'):
         df = pd.read_csv(uploaded)
@@ -224,12 +235,19 @@ except Exception as e:
     st.error(f'Failed to read file: {e}')
     st.stop()
 
-if col_name not in df.columns:
-    st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
-    st.stop()
+# choose column: prefer the user text input; if blank, choose default if present else show selectbox
+if col_name_input and col_name_input in df.columns:
+    text_col = col_name_input
+else:
+    if example_default_col in df.columns and not col_name_input:
+        text_col = example_default_col
+    else:
+        # ask user to choose from columns
+        text_col = st.sidebar.selectbox('Select text column', options=list(df.columns), index=0)
 
-st.success(f'Loaded {len(df)} rows. Processing...')
+st.success(f'Loaded {len(df)} rows. Using column: "{text_col}"')
 
+# -------------------- Regex-only processing (build sentence column and regex extractions) --------------------
 @st.cache_data
 def process_df_regex_only(df, text_col):
     rows = []
@@ -257,7 +275,7 @@ def process_df_regex_only(df, text_col):
         def fmt_extracted_hba(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                return fmt_pct(m.get('reduction_pp'))
+                return fmt_pct_val(m.get('reduction_pp'))
             return m.get('raw', '')
 
         wt_matches, wt_sentences = extract_sentences(text, re_weight, 'weight')
@@ -265,7 +283,7 @@ def process_df_regex_only(df, text_col):
         def fmt_extracted_wt(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                return fmt_pct(m.get('reduction_pp'))
+                return fmt_pct_val(m.get('reduction_pp'))
             return m.get('raw', '')
 
         new = row.to_dict()
@@ -304,7 +322,7 @@ def process_df_regex_only(df, text_col):
     )
     return out
 
-out_df = process_df_regex_only(df, col_name)
+out_df = process_df_regex_only(df, text_col)
 
 # -------------------- Gemini 2.0 Flash setup --------------------
 def configure_gemini(api_key: str):
@@ -320,24 +338,33 @@ model = configure_gemini(API_KEY)
 
 def _norm_percent(v: str) -> str:
     v = (v or "").strip().replace(" ", "")
-    if v and not v.endswith("%"):
-        if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
-            v += "%"
-    return v
+    if not v:
+        return ""
+    # remove surrounding chars
+    # allow numbers with optional %; convert comma/dot
+    v2 = v.replace(',', '.').replace('·', '.')
+    m = re.search(r'[+-]?\d+(?:\.\d+)?', v2)
+    if not m:
+        return ""
+    num = float(m.group(0))
+    num = abs(num)  # convert negative to positive for selected % as requested
+    # format nicely
+    s = f"{num:.3f}".rstrip('0').rstrip('.')
+    return f"{s}%"
 
 # Prompt rules:
 # - LLM reads just the 'sentence' (or 'weight_sentence') string.
 # - Extract only percentages pertaining to the requested target (HbA1c or body weight).
 # - Prefer T12/12 months over T6/6 months when both appear.
-# - If timepoint context is mentioned (T6/T12/6 months/12 months), rank accordingly; otherwise choose the primary change.
-# - Output strict JSON: {"extracted":["...","..."], "selected_percent":"..."} with % signs.
+# - If 'from X% to Y%' appears, the reported change is (X - Y) percentage points (LLM may also output reductions phrased "reduced by Z%").
+# - Output strict JSON: {"extracted":["1.23%","0.85%"], "selected_percent":"1.23%"} with percent sign and numeric values.
+# - Do not include irrelevant values.
 LLM_RULES = (
     "You are an information extraction model. Read the given sentence(s) and:\n"
     "1) Extract ONLY percentage changes for the TARGET (either HbA1c/A1c or body weight).\n"
     "2) If multiple values exist at different timepoints, prefer 12 months or T12 over 6 months or T6.\n"
     "   Keywords to interpret time: '12 months', '12-mo', 'T12' > '6 months', '6-mo', 'T6'.\n"
-    "3) If 'from X% to Y%' appears, the reported change is (X - Y) percentage points, but you may also\n"
-    "   keep any explicit percentage change phrases like 'reduced by Z%'.\n"
+    "3) If 'from X% to Y%' appears, the reported change is (X - Y) percentage points.\n"
     "4) Return STRICT JSON only: {\"extracted\":[\"1.23%\",\"0.85%\"], \"selected_percent\":\"1.23%\"}.\n"
     "5) Do not include non-target values (e.g., body weight when target is HbA1c, or vice versa).\n"
 )
@@ -355,13 +382,24 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str):
         text = (getattr(resp, "text", "") or "").strip()
         s, e = text.find("{"), text.rfind("}")
         if s != -1 and e > s:
-            data = json.loads(text[s:e+1])
-            extracted = [_norm_percent(x) for x in (data.get("extracted") or []) if isinstance(x, str)]
-            selected = _norm_percent(data.get("selected_percent", ""))
+            payload = text[s:e+1]
+            data = json.loads(payload)
+            extracted = []
+            for x in (data.get("extracted") or []):
+                if isinstance(x, str):
+                    nx = _norm_percent(x)
+                    if nx:
+                        extracted.append(nx)
+            selected = _norm_percent(data.get("selected_percent", "") or "")
             return extracted, selected
     except Exception:
         pass
-    return [], ""
+    # fallback: try to return percentages found by regex in the sentence (limited)
+    found = []
+    for m in re_pct.finditer(sentence):
+        found.append(_norm_percent(m.group(0)))
+    sel = found[0] if found else ""
+    return found, sel
 
 # -------------------- Run LLM over the *sentence columns* --------------------
 # HbA1c
@@ -378,7 +416,71 @@ wt_llm = out_df.get("weight_sentence", pd.Series(dtype=str)).fillna("").astype(s
 out_df["Weight LLM extracted"] = [vals for vals, sel in wt_llm]
 out_df["Weight selected %"]    = [sel  for vals, sel in wt_llm]
 
-# -------------------- Reorder columns: place LLM columns BESIDE regex columns --------------------
+# -------------------- Scoring (A1c Score & Weight Score) --------------------
+def a1c_score_from_selected_pct(pct_str: str) -> int:
+    """
+    Scores for A1c:
+    5: > 2.2%
+    4: 1.8% - 2.1%
+    3: 1.2% - 1.7%
+    2: 0.8% - 1.1%
+    1: < 0.8%
+    """
+    if not pct_str:
+        return 0
+    try:
+        num = float(pct_str.replace('%',''))
+    except:
+        return 0
+    if num > 2.2:
+        return 5
+    if 1.8 <= num <= 2.1:
+        return 4
+    if 1.2 <= num <= 1.7:
+        return 3
+    if 0.8 <= num <= 1.1:
+        return 2
+    if num < 0.8:
+        return 1
+    # If falls into gap (e.g., 1.15 or 1.75), assign nearest bucket sensibly:
+    if num < 1.2:
+        return 2
+    if num < 1.8:
+        return 3
+    return 1
+
+def weight_score_from_selected_pct(pct_str: str) -> int:
+    """
+    Scores for weight:
+    5: >= 22%
+    4: 16 - 21.9%
+    3: 10 - 15.9%
+    2: 5 - 9.9%
+    1: <5%
+    """
+    if not pct_str:
+        return 0
+    try:
+        num = float(pct_str.replace('%',''))
+    except:
+        return 0
+    if num >= 22:
+        return 5
+    if 16 <= num <= 21.9:
+        return 4
+    if 10 <= num <= 15.9:
+        return 3
+    if 5 <= num <= 9.9:
+        return 2
+    if num < 5:
+        return 1
+    return 0
+
+# Apply scores
+out_df["A1c Score"] = out_df["selected %"].fillna("").astype(str).apply(lambda x: a1c_score_from_selected_pct(x))
+out_df["Weight Score"] = out_df["Weight selected %"].fillna("").astype(str).apply(lambda x: weight_score_from_selected_pct(x))
+
+# -------------------- Reorder columns: place LLM & Score columns BESIDE regex columns --------------------
 def insert_after(cols, after, names):
     if after not in cols:
         return cols
@@ -392,9 +494,11 @@ def insert_after(cols, after, names):
 display_df = out_df.copy()
 # HbA1c LLM columns next to extracted_matches
 cols = list(display_df.columns)
-cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %"])
+cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
 # Weight LLM columns next to weight_extracted_matches
-cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %"])
+cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
+# keep only columns that exist
+cols = [c for c in cols if c in display_df.columns]
 display_df = display_df[cols]
 
 # -------------------- Show results --------------------
@@ -428,6 +532,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_with_llm_from_sentence.xlsx',
+    file_name='results_with_llm_from_sentence_and_scores.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
