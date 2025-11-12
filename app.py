@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = "AIzaSyDNTwzO9tlpNDUpw8Y6SpSINt3rUdxzkK4f"   # <- replace with your real key
+API_KEY = ""   # <- replace with your real key
 # =========================================================================
 
 # Lazy Gemini import so the app still runs without it
