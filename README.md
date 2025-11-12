@@ -1,9 +1,2 @@
-AttributeError: 'dict' object has no attribute 'columns'
-
-File "C:\Users\p90022569\Downloads\score\venv\lib\site-packages\streamlit\runtime\scriptrunner\exec_code.py", line 129, in exec_func_with_error_handling
-    result = func()
-File "C:\Users\p90022569\Downloads\score\venv\lib\site-packages\streamlit\runtime\scriptrunner\script_runner.py", line 669, in code_to_exec
-    exec(code, module.__dict__)  # noqa: S102
-File "C:\Users\p90022569\Downloads\score\app.py", line 239, in <module>
-    if col_name_input and col_name_input in df.columns:
-    
+ At week 36, semaglutide yielded a 13Â·88% (SE 0Â·90) body weight reduction compared with 0Â·42% (SE 0Â·93) for placebo (between-group difference: -13Â·46%; p<0Â·0001)
+ 
