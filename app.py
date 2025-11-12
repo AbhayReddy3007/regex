@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"   # <- replace with your real key
+API_KEY = "AIzaSyDNTwzO9tlpNDUpw8Y6SpSINt3rUdxzkK4f"   # <- replace with your real key
 # =========================================================================
 
 # Lazy Gemini import so the app still runs without it
@@ -338,7 +338,7 @@ LLM_RULES = (
     "   Keywords to interpret time: '12 months', '12-mo', 'T12' > '6 months', '6-mo', 'T6'.\n"
     "3) If 'from X% to Y%' appears, the reported change is (X - Y) percentage points, but you may also\n"
     "   keep any explicit percentage change phrases like 'reduced by Z%'.\n"
-    "4) Return STRICT JSON only: {\"extracted\":[\"1.2%\",\"0.8%\"], \"selected_percent\":\"1.2%\"}.\n"
+    "4) Return STRICT JSON only: {\"extracted\":[\"1.23%\",\"0.85%\"], \"selected_percent\":\"1.23%\"}.\n"
     "5) Do not include non-target values (e.g., body weight when target is HbA1c, or vice versa).\n"
 )
 
