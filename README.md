@@ -1,3 +1,2 @@
- At week 36, semaglutide yielded a 13Â·88% (SE 0Â·90) body weight reduction compared with 0Â·42% (SE 0Â·93) for placebo (between-group difference: -13Â·46%; p<0Â·0001)
- 
-â‰¥40% or â‰¥50%
+When adjusted for age and BMI, body weight and HbA1c reduction were not significantly different between the two formulations, as the proportion of patients achieving the composite outcome of weight loss ≥ 5% and HbA1c < 7.0%.
+This is the threshhold not the reduction. It is extracting incorrect values.
