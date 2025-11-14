@@ -287,16 +287,78 @@ def _norm_percent(v: str) -> str:
     return v
 
 # LLM prompt & extraction
-LLM_RULES = (
-    "You are an extractor. Read the provided SENTENCE(S) and the TARGET label.\n"
-    "Extract ONLY percentage *changes* that describe reduction (or change) for the TARGET.\n"
-    "- If you see `from X% to Y%` or `declined from X% to Y%` or `improved from X% to Y%`, compute X - Y (percentage points) and include that number (positive if a reduction in HbA1c or weight).\n"
-    "- Ignore threshold mentions (e.g., 'HbA1c < 7.0%', '≥5% target') — these are NOT reductions.\n"
-    "- Prefer values tied to timepoint '12 months' / 'T12' over '6 months' / 'T6' when both present.\n"
-    "- If multiple drugs are present and a drug_name is provided, prefer values associated with that drug.\n"
-    "Return STRICT JSON ONLY with keys: {\"extracted\": [\"1.23%\",\"0.85%\"], \"selected_percent\": \"1.23%\"}\n"
-    "If nothing relevant, return {\"extracted\": [], \"selected_percent\": \"\"}.\n"
-)
+LLM_RULES = """
+You are an information-extraction assistant. Read the SENTENCE(S) provided and **extract only percentage CHANGES** that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
+
+OUTPUT FORMAT (exact JSON):
+{
+  "extracted": ["1.23%", "0.85%"],      // array of strings (percent with % sign) — values the LLM finds relevant in the sentence(s)
+  "selected_percent": "1.23%"           // single string (percent) the LLM chooses as the *best* value for the sentence(s) and target
+}
+
+GENERAL PRINCIPLES
+1. Normalize numbers:
+   - Convert decimal separators to a period (e.g., "13·88", "13,88" -> "13.88").
+   - Remove typographic artifacts (e.g., "Â·", "â‰¥") and normalize spacing.
+   - Always return percentages with a trailing '%' and use dot decimals (e.g., "13.88%").
+
+2. Only extract *change percentages* (reductions or increases) relevant to the TARGET:
+   - Accept formats like "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "from 8.5% to 7.5%" (see computation rule below).
+   - **Ignore** statistics that are not change values: standard errors (SE), p-values, CIs, prevalence/threshold statements (e.g., "≥5%", "HbA1c < 7.0%"), proportions (e.g., "proportion achieving ≥5%"), and labels such as "SE 0.90" or "(p<0.001)".
+   - If a percentage is clearly a threshold, target, or eligibility cutoff (e.g., "HbA1c < 7.0%", "weight loss ≥5%"), do NOT treat it as a reduction — do not include it.
+
+3. "from X% to Y%" / "declined from X% to Y%" / "improved from X% to Y%":
+   - Compute and return the difference as (X - Y) percentage points.
+   - Example: "declined from 8.5% to 7.0%" → extracted should include "1.5%" (and selected may be "1.5%" if it is the best).
+   - Maintain sign-neutral output for `selected_percent` (see rule on sign). In the `extracted` array you may include the computed value with %.
+
+4. Prefer the within-group (drug) change over between-group difference:
+   - If a sentence contains both a within-group percent for a drug (e.g., "semaglutide yielded 13.88% body weight reduction") **and** a between-group difference (e.g., "between-group difference: -13.46%"), **prefer the within-group percent** for the drug’s selected value.
+   - Only select a between-group value if no within-group value for the requested drug is present in the sentence.
+
+5. Respect drug context when multiple drugs are mentioned:
+   - If a `drug_name` is provided externally, use it to pick the value(s) that belong to that drug.
+   - Choose the percent that is attached/closest to that drug mention or the percent that is explicitly described for that drug group (e.g., "in the oral semaglutide group ... -1.75%").
+   - If multiple values exist for different drugs in the same sentence, **do not** guess — use `drug_name` to decide which value to extract/choose.
+
+6. Timepoint preference (T12 over T6):
+   - If the sentence mentions multiple timepoints, prefer values reported at **12 months** (or T12, 12-mo, month 12) over **6 months** (T6, 6-mo, month 6).
+   - If multiple values for the same target exist at different timepoints, include all as `extracted` but choose the **selected_percent** based on the timepoint preference (T12 > T6 > unspecified).
+   - If a specific timepoint is not referenced, treat values as general and apply the other rules.
+
+7. Avoid picking spurious percentages:
+   - Exclude SE (e.g., "(SE 0.90)"), p-values, confidence intervals, sample-size percentages, age/age-range percentages, and threshold conditions. Only include percentages that clearly denote change magnitude for the target.
+   - If a percent appears in parentheses immediately after a metric but is unclear (e.g., "(SE 0·90)"), do NOT include it.
+
+8. Sign handling:
+   - For `extracted` you may capture negative values if they appear, but `selected_percent` **must be returned as a positive value** (absolute magnitude) with '%' sign.
+   - If the sentence indicates a decrease as "-1.75%" or "reduction of 1.75%", the `selected_percent` should be "1.75%".
+
+9. When no valid change percent is found:
+   - Return `"extracted": []` and `"selected_percent": ""` (empty string). Do not fall back to regex candidates or heuristics outside of the sentence context.
+
+10. JSON strictness:
+    - Return exactly one JSON object with only the two keys: `extracted` (array) and `selected_percent` (string). No extra text, commentary or explanation.
+    - Percent strings must include the '%' sign. If `selected_percent` is empty, it must be the empty string not null.
+
+11. Examples (behavioral):
+    - SENTENCE: "At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% ... (between-group difference: -13·46%)"
+      → `extracted` should include "13.88%" (within-group) and may include "13.46%" as an additional extracted value, BUT `selected_percent` should be "13.88%" for the drug (because within-group value attached to the drug is preferred).
+    - SENTENCE: "Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% ... and -3.64 kg ... in the oral semaglutide group..."
+      → For HbA1c extraction: `extracted` includes "1.75%"; `selected_percent` "1.75%".
+    - SENTENCE: "Coprimary endpoints were percent bodyweight change and proportion reaching >=5% bodyweight reduction."
+      → `extracted` is `[]` and `selected_percent` is `""` because the sentence defines endpoints or thresholds, not a reported reduction magnitude.
+
+12. Additional robustness:
+    - Normalize unusual characters (e.g., handle "13·88" or "13,88" as 13.88).
+    - If a percent is formatted with thousand separators or nonstandard punctuation, normalize before returning.
+
+FALLBACK / EDGE CASES
+- If sentence includes multiple valid reduction percentages for the same drug and same timepoint, include them all in `extracted` and choose the most prominently stated one as `selected_percent` (prominence = explicit "reduced by X%", or value directly attached to the drug phrase, or the T12 timepoint per rule 6).
+- If drug_name is not provided and multiple drugs are present, select the percent that is most directly tied to the target phrase (e.g., "% body weight reduction" adjacent to a drug mention). If ambiguity remains, return all extracted candidates and leave `selected_percent` empty.
+
+That is all. RETURN ONLY THE JSON OBJECT (no explanation)."""
+
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
