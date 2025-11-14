@@ -1,1 +1,1 @@
-At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% (SE 0·93) for placebo (between-group difference: -13·46%; p<0·0001).
+Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% (P< 0.001) and -3.64 kg (P= 0.015), respectively, in the oral semaglutide group and -1.35% (P< 0.001) and -5.26 kg (P< 0.001), respectively, in the injectable semaglutide group.
