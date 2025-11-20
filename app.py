@@ -1,6 +1,7 @@
 # streamlit_hba1c_weight_llm.py
-# Final full file — includes forced relative reduction for "from X% to Y%" (HbA1c),
-# range-high endpoint selection, dose-aware highest-dose preference, and final-max selection.
+# Enforces relative reduction for 'from X% to Y%' for HbA1c by computing it from regex matches
+# (process_df gives precedence to regex from->to match and uses its relative percent as selected),
+# while keeping all existing LLM/range/dose logic intact.
 
 import re
 import math
@@ -594,10 +595,25 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if drug_col_name and drug_col_name in df_in.columns:
             drug_hint = str(row.get(drug_col_name, '') or "")
 
-        # HbA1c LLM
+        # ---- NEW: if regex found a from-to match for HbA1c, compute relative reduction and skip LLM ----
         hba_llm_extracted, hba_selected = ([], "")
-        if _model is not None and sentence_str:
-            hba_llm_extracted, hba_selected = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
+        # find first from-to regex match from hba_matches (they already include reduction_pp)
+        from_to_found = None
+        for m in hba_matches:
+            if (m.get('type') or '').lower().startswith('hba1c:from-to'):
+                # reduction_pp already computed as relative reduction in extract_in_sentence
+                rp = m.get('reduction_pp')
+                if rp is not None and not (isinstance(rp, float) and math.isnan(rp)):
+                    from_to_found = rp
+                    break
+        if from_to_found is not None:
+            comp = fmt_pct(from_to_found)
+            hba_llm_extracted = [comp]
+            hba_selected = comp
+        else:
+            # fallback to LLM behavior for HbA1c
+            if _model is not None and sentence_str:
+                hba_llm_extracted, hba_selected = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
 
         # Weight LLM
         wt_llm_extracted, wt_selected = ([], "")
