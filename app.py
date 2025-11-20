@@ -1,4 +1,4 @@
-# streamlit_hba1c_weight_llm.py
+# streamlit_hba1c_weight_llm.py (updated: compute relative reduction for 'from X% to Y%' and dosage-aware selection)
 import re
 import math
 import json
@@ -144,14 +144,26 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
       • For all other % patterns, search ONLY within a ±5-SPACES (inclusive-token) window
         around each term occurrence.
       • EXTRA (weight only): If window yields nothing, capture the NEAREST PREVIOUS % within 60 chars.
+
+    Additional behavior:
+      • If the sentence contains dosage mentions like '0.5 mg' or '1mg', prefer matches that are closest to
+        the highest dosage mentioned in the sentence.
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp)
+    # 1) WHOLE-SENTENCE: "from X% to Y%"  -> compute relative reduction % = ((X - Y) / X) * 100
     for m in re_fromto.finditer(sent):
-        a = parse_number(m.group(1)); b = parse_number(m.group(2))
-        red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
-        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
+        a = parse_number(m.group(1))  # original value (X)
+        b = parse_number(m.group(2))  # new value (Y)
+        reduction_pct = None
+        # ensure numbers are valid and avoid division by zero
+        if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
+            try:
+                reduction_pct = ((a - b) / a) * 100.0
+            except Exception:
+                reduction_pct = None
+        # store original components in `values` and put the computed percent in reduction_pp
+        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_pct)
 
     # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
     any_window_hit = False
@@ -197,6 +209,32 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 abs_start = left
                 v = parse_number(last_pct.group(1))
                 add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
+
+    # --- dosage-aware filtering ---
+    # detect dosages like '0.5 mg' or '1mg' (case-insensitive)
+    mg_pattern = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:mg|mg\.)\b', re.IGNORECASE)
+    mg_occurrences = []
+    for mm in mg_pattern.finditer(sent):
+        val = parse_number(mm.group(1))
+        if not math.isnan(val):
+            mg_occurrences.append((val, mm.start()))
+
+    if mg_occurrences and matches:
+        # pick the highest dosage (if tie, prefer earlier occurrence)
+        mg_occurrences.sort(key=lambda x: (-x[0], x[1]))
+        highest_mg_val, highest_mg_pos = mg_occurrences[0]
+
+        # compute distance of each match center to highest_mg_pos and keep only closest match(es)
+        def match_center(m):
+            s_span, e_span = m['span'][0], m['span'][1]
+            return (s_span + e_span) / 2.0
+
+        distances = [abs(match_center(m) - highest_mg_pos) for m in matches]
+        if distances:
+            min_dist = min(distances)
+            tol = 5  # small tolerance to allow ties
+            filtered = [m for m, d in zip(matches, distances) if d <= (min_dist + tol)]
+            matches = filtered
 
     # de-dupe by span
     seen = set()
@@ -482,7 +520,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                # present as delta (pp)
+                # present as percent reduction (relative): ((X - Y)/X)*100
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
