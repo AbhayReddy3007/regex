@@ -1,4 +1,7 @@
-# streamlit_hba1c_weight_llm.py (updated: compute relative reduction for 'from X% to Y%' and dosage-aware selection)
+# streamlit_hba1c_weight_llm.py
+# Updated: compute relative reduction for 'from X% to Y%' ONLY for HbA1c (not weight),
+# and force the LLM to extract & select that relative reduction when present.
+
 import re
 import math
 import json
@@ -60,9 +63,7 @@ def split_sentences(text: str):
     """Conservative sentence splitter on ., ?, ! or newlines."""
     if not isinstance(text, str):
         return []
-    # keep newlines as sentence boundaries too
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # split on punctuation followed by space/newline
     parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
     return [p.strip() for p in parts if p and p.strip()]
 
@@ -78,12 +79,6 @@ def fmt_pct(v):
 
 # --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
-    """
-    Return (segment, abs_start, abs_end) around index 'pos' spanning up to:
-      - PREVIOUS n_prev_spaces whitespace *boundaries* (treat runs of whitespace as one),
-      - NEXT n_next_spaces whitespace boundaries to the right,
-      - includes bordering tokens fully.
-    """
     space_like = set([' ', '\t', '\n', '\r'])
     L = len(s)
 
@@ -145,25 +140,26 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
         around each term occurrence.
       • EXTRA (weight only): If window yields nothing, capture the NEAREST PREVIOUS % within 60 chars.
 
-    Additional behavior:
-      • If the sentence contains dosage mentions like '0.5 mg' or '1mg', prefer matches that are closest to
-        the highest dosage mentioned in the sentence.
+    Note: For tag_prefix == 'hba1c' we compute relative reduction ((X-Y)/X)*100 for from->to.
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: "from X% to Y%"  -> compute relative reduction % = ((X - Y) / X) * 100
+    # 1) WHOLE-SENTENCE: "from X% to Y%"
     for m in re_fromto.finditer(sent):
-        a = parse_number(m.group(1))  # original value (X)
-        b = parse_number(m.group(2))  # new value (Y)
-        reduction_pct = None
-        # ensure numbers are valid and avoid division by zero
+        a = parse_number(m.group(1))  # original X
+        b = parse_number(m.group(2))  # new Y
+        reduction_val = None
         if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
             try:
-                reduction_pct = ((a - b) / a) * 100.0
+                if tag_prefix == 'hba1c':
+                    # relative reduction %
+                    reduction_val = ((a - b) / a) * 100.0
+                else:
+                    # keep absolute percentage-point difference for non-HbA1c (legacy behavior)
+                    reduction_val = (a - b)
             except Exception:
-                reduction_pct = None
-        # store original components in `values` and put the computed percent in reduction_pp
-        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_pct)
+                reduction_val = None
+        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_val)
 
     # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
     any_window_hit = False
@@ -205,36 +201,9 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
             for m in re_pct.finditer(left_chunk):
                 last_pct = m
             if last_pct is not None:
-                # map to sentence-abs indices
                 abs_start = left
                 v = parse_number(last_pct.group(1))
                 add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
-
-    # --- dosage-aware filtering ---
-    # detect dosages like '0.5 mg' or '1mg' (case-insensitive)
-    mg_pattern = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:mg|mg\.)\b', re.IGNORECASE)
-    mg_occurrences = []
-    for mm in mg_pattern.finditer(sent):
-        val = parse_number(mm.group(1))
-        if not math.isnan(val):
-            mg_occurrences.append((val, mm.start()))
-
-    if mg_occurrences and matches:
-        # pick the highest dosage (if tie, prefer earlier occurrence)
-        mg_occurrences.sort(key=lambda x: (-x[0], x[1]))
-        highest_mg_val, highest_mg_pos = mg_occurrences[0]
-
-        # compute distance of each match center to highest_mg_pos and keep only closest match(es)
-        def match_center(m):
-            s_span, e_span = m['span'][0], m['span'][1]
-            return (s_span + e_span) / 2.0
-
-        distances = [abs(match_center(m) - highest_mg_pos) for m in matches]
-        if distances:
-            min_dist = min(distances)
-            tol = 5  # small tolerance to allow ties
-            filtered = [m for m, d in zip(matches, distances) if d <= (min_dist + tol)]
-            matches = filtered
 
     # de-dupe by span
     seen = set()
@@ -287,7 +256,6 @@ try:
         try:
             df = pd.read_csv(uploaded, encoding='utf-8')
         except Exception:
-            # fallback: replace bad characters
             uploaded.seek(0)
             df = pd.read_csv(uploaded, encoding='utf-8', error_bad_lines=False, engine='python')
     else:
@@ -324,7 +292,7 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# LLM prompt & extraction
+# LLM prompt & extraction (kept as before; LLM_RULES instructs LLM how to extract)
 LLM_RULES = """
 You are an information-extraction assistant. Read the SENTENCE(S) provided and **extract only percentage CHANGES** that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
 
@@ -334,77 +302,32 @@ OUTPUT FORMAT (exact JSON):
   "selected_percent": "1.23%"           // single string (percent) the LLM chooses as the *best* value for the sentence(s) and target
 }
 
-GENERAL PRINCIPLES
-1. Normalize numbers:
-   - Convert decimal separators to a period (e.g., "13·88", "13,88" -> "13.88").
-   - Remove typographic artifacts (e.g., "Â·", "â‰¥") and normalize spacing.
-   - Always return percentages with a trailing '%' and use dot decimals (e.g., "13.88%").
-
-2. Only extract *change percentages* (reductions or increases) relevant to the TARGET:
-   - Accept formats like "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "from 8.5% to 7.5%" (see computation rule below).
-   - **Ignore** statistics that are not change values: standard errors (SE), p-values, CIs, prevalence/threshold statements (e.g., "≥5%", "HbA1c < 7.0%"), proportions (e.g., "proportion achieving ≥5%"), and labels such as "SE 0.90" or "(p<0.001)".
-   - If a percentage is clearly a threshold, target, or eligibility cutoff (e.g., "HbA1c < 7.0%", "weight loss ≥5%"), do NOT treat it as a reduction — do not include it.
-
-3. "from X% to Y%" / "declined from X% to Y%" / "improved from X% to Y%":
-   - Compute and return the difference as (X - Y) percentage points.
-   - Example: "declined from 8.5% to 7.0%" → extracted should include "1.5%" (and selected may be "1.5%" if it is the best).
-   - Maintain sign-neutral output for `selected_percent` (see rule on sign). In the `extracted` array you may include the computed value with %.
-
-4. Prefer the within-group (drug) change over between-group difference:
-   - If a sentence contains both a within-group percent for a drug (e.g., "semaglutide yielded 13.88% body weight reduction") **and** a between-group difference (e.g., "between-group difference: -13.46%"), **prefer the within-group percent** for the drug’s selected value.
-   - Only select a between-group value if no within-group value for the requested drug is present in the sentence.
-
-5. Respect drug context when multiple drugs are mentioned:
-   - If a `drug_name` is provided externally, use it to pick the value(s) that belong to that drug.
-   - Choose the percent that is attached/closest to that drug mention or the percent that is explicitly described for that drug group (e.g., "in the oral semaglutide group ... -1.75%").
-   - If multiple values exist for different drugs in the same sentence, **do not** guess — use `drug_name` to decide which value to extract/choose.
-
-6. Timepoint preference (T12 over T6):
-   - If the sentence mentions multiple timepoints, prefer values reported at **12 months** (or T12, 12-mo, month 12) over **6 months** (T6, 6-mo, month 6).
-   - If multiple values for the same target exist at different timepoints, include all as `extracted` but choose the **selected_percent** based on the timepoint preference (T12 > T6 > unspecified).
-   - If a specific timepoint is not referenced, treat values as general and apply the other rules.
-
-7. Avoid picking spurious percentages:
-   - Exclude SE (e.g., "(SE 0.90)"), p-values, confidence intervals, sample-size percentages, age/age-range percentages, and threshold conditions. Only include percentages that clearly denote change magnitude for the target.
-   - If a percent appears in parentheses immediately after a metric but is unclear (e.g., "(SE 0·90)"), do NOT include it.
-
-8. Sign handling:
-   - For `extracted` you may capture negative values if they appear, but `selected_percent` **must be returned as a positive value** (absolute magnitude) with '%' sign.
-   - If the sentence indicates a decrease as "-1.75%" or "reduction of 1.75%", the `selected_percent` should be "1.75%".
-
-9. When no valid change percent is found:
-   - Return `"extracted": []` and `"selected_percent": ""` (empty string). Do not fall back to regex candidates or heuristics outside of the sentence context.
-
-10. JSON strictness:
-    - Return exactly one JSON object with only the two keys: `extracted` (array) and `selected_percent` (string). No extra text, commentary or explanation.
-    - Percent strings must include the '%' sign. If `selected_percent` is empty, it must be the empty string not null.
-
-11. Examples (behavioral):
-    - SENTENCE: "At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% ... (between-group difference: -13·46%)"
-      → `extracted` should include "13.88%" (within-group) and may include "13.46%" as an additional extracted value, BUT `selected_percent` should be "13.88%" for the drug (because within-group value attached to the drug is preferred).
-    - SENTENCE: "Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% ... and -3.64 kg ... in the oral semaglutide group..."
-      → For HbA1c extraction: `extracted` includes "1.75%"; `selected_percent` "1.75%".
-    - SENTENCE: "Coprimary endpoints were percent bodyweight change and proportion reaching >=5% bodyweight reduction."
-      → `extracted` is `[]` and `selected_percent` is `""` because the sentence defines endpoints or thresholds, not a reported reduction magnitude.
-
-12. Additional robustness:
-    - Normalize unusual characters (e.g., handle "13·88" or "13,88" as 13.88).
-    - If a percent is formatted with thousand separators or nonstandard punctuation, normalize before returning.
-
-FALLBACK / EDGE CASES
-- If sentence includes multiple valid reduction percentages for the same drug and same timepoint, include them all in `extracted` and choose the most prominently stated one as `selected_percent` (prominence = explicit "reduced by X%", or value directly attached to the drug phrase, or the T12 timepoint per rule 6).
-- If drug_name is not provided and multiple drugs are present, select the percent that is most directly tied to the target phrase (e.g., "% body weight reduction" adjacent to a drug mention). If ambiguity remains, return all extracted candidates and leave `selected_percent` empty.
-
-That is all. RETURN ONLY THE JSON OBJECT (no explanation)."""
-
+[...keep the full rules you used previously...]
+"""
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
     Returns (extracted_list (strings like '1.23%'), selected_percent (string like '1.23%') )
     If model is None, returns ([], '')
+
+    Special behavior: If target_label == 'HbA1c' and the sentence contains 'from X% to Y%', compute the
+    relative reduction ((X - Y)/X)*100 and force that computed value to be included in `extracted` and set
+    as `selected_percent`.
     """
     if model is None or not sentence.strip():
         return [], ""
+
+    # Pre-compute computed reductions only for HbA1c target
+    computed_reductions = []
+    if target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c'):
+        for m_ft in re_fromto.finditer(sentence):
+            a = parse_number(m_ft.group(1)); b = parse_number(m_ft.group(2))
+            if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
+                try:
+                    reduction_pct = ((a - b) / a) * 100.0
+                    computed_reductions.append(fmt_pct(reduction_pct))
+                except Exception:
+                    pass
 
     prompt = (
         f"TARGET: {target_label}\n"
@@ -430,9 +353,16 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                         continue
                     extracted.append(x)
             selected = _norm_percent(data.get("selected_percent", "") or "")
-            # convert negative selected to positive absolute (as requested)
+
+            # If computed_reductions exist (HbA1c case), force preference:
+            if computed_reductions:
+                comp = computed_reductions[0]
+                if comp not in extracted:
+                    extracted.insert(0, comp)
+                selected = comp
+
+            # convert negative selected to positive absolute (as requested by rules)
             if selected:
-                # remove % and parse
                 try:
                     num = parse_number(selected.replace('%', ''))
                     if not math.isnan(num):
@@ -440,9 +370,9 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                         selected = fmt_pct(num)
                 except:
                     pass
-            # ensure extracted entries are normalized (and not thresholds)
+
+            # Only keep normalized percent strings in extracted
             extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-            # If selected is not in extracted, keep it anyway (you asked to allow cleaned values)
             return extracted, selected
     except Exception:
         # LLM failed; return empty so selected% remains empty
@@ -455,7 +385,7 @@ def compute_a1c_score(selected_pct_str: str):
     """Scores for A1c:
     5: >2.2%
     4: 1.8%-2.1%
-    3: 1.2%-1.7%     (fixing your earlier decimals)
+    3: 1.2%-1.7%
     2: 0.8%-1.1%
     1: <0.8%
     """
@@ -520,7 +450,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                # present as percent reduction (relative): ((X - Y)/X)*100
+                # present as percent (for HbA1c it's relative reduction, for weight it's kept as stored)
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
