@@ -6,4 +6,4 @@ This study assessed the real-world effectiveness of available GLP-1 RAs in Roman
 
 From a baseline range of 8.1-8.7 %, 0.5 mg dose lowered HbA1c by 1.2-1.5 %, while the 1.0 mg dose reduced it by 1.4-1.8 %.
 
-HbA1c reductions ranged from -0.63% ± 0.03% (lixisenatide, 20 μg q.d.) to -1.79% ± 0.09% (tirzepatide, 15 mg q.w.; p < 0.0001).
+HbA1c improved from 8.2 % to 7.1 %, with total daily insulin dose decreasing from 1.4 to 0.7 IU/kg/day (p < 0.001).
