@@ -1,6 +1,11 @@
-# streamlit_hba1c_weight_llm.py
-# Updated: compute relative reduction for 'from X% to Y%' ONLY for HbA1c (not weight),
-# and force the LLM to extract & select that relative reduction when present.
+# streamlit_hbaA1c_weight_llm_final.py
+# Full Streamlit app:
+# - For HbA1c: "from X% to Y%" -> relative reduction ((X - Y)/X)*100 stored & preferred by LLM
+# - For weight: legacy behavior (absolute difference) preserved
+# - LLM post-processing: forced selection of computed HbA1c reduction when present,
+#   drug_hint proximity selection, and (if dosages present) prefer values closest to highest dose
+# - Regex path ignores threshold/proportion percents (e.g., ">=5%", "proportion achieving 5%")
+# - Outputs an Excel download
 
 import re
 import math
@@ -11,7 +16,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = ""   # <- replace with your real key
+API_KEY = ""   # <- replace with your real key (or leave blank to disable LLM)
 # =========================================================================
 
 # Lazy Gemini import so the app still runs without the package
@@ -23,7 +28,7 @@ except Exception:
     GENAI_AVAILABLE = False
 
 st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor", layout="wide")
-st.title("HbA1c / A1c + Body Weight — regex + Gemini 2.0 Flash (reads the sentence column)")
+st.title("HbA1c / A1c + Body Weight — regex + Gemini 2.0 Flash (sentence-level extractor)")
 
 # -------------------- Regex helpers --------------------
 NUM = r'(?:[+-]?\d+(?:[.,·]\d+)?)'
@@ -59,33 +64,87 @@ def parse_number(s: str) -> float:
     except Exception:
         return float('nan')
 
-def split_sentences(text: str):
-    """Conservative sentence splitter on ., ?, ! or newlines."""
-    if not isinstance(text, str):
-        return []
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
-    return [p.strip() for p in parts if p and p.strip()]
-
-def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
-    """Require: (target term) AND a % AND a reduction cue."""
-    return bool(term_re.search(sent)) and bool(re_pct.search(sent)) and bool(re_reduction_cue.search(sent))
-
 def fmt_pct(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return ''
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
-# --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
+def split_sentences(text: str):
+    if not isinstance(text, str):
+        return []
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+# Determine if a percent mention at absolute indices is a threshold/proportion mention
+def is_threshold_percent_at(abs_start: int, abs_end: int, sent: str) -> bool:
+    """
+    Look for nearby context suggesting threshold/proportion, e.g.:
+      - words: proportion, achieving, achieving, threshold, eligible, proportion of
+      - comparison operators: >=, <=, <, >
+    """
+    if not isinstance(sent, str):
+        return False
+    ctx_start = max(0, abs_start - 40)
+    ctx_end = min(len(sent), abs_end + 20)
+    ctx = sent[ctx_start:ctx_end].lower()
+    if re.search(r"\b(proportion|proportion of|achiev|achieving|reach|reaching|threshold|eligible|eligib|target|cut[- ]?off|responders|response)\b", ctx):
+        return True
+    if re.search(r"[<>≤≥=]{1,2}", ctx):
+        return True
+    # also treat constructions like "HbA1c < 7.0%" explicitly as threshold (if metric + comparator)
+    if re.search(r'\b(?:hb\s*a1c|a1c|weight|bwr|body weight|bmi)\b', ctx) and re.search(r"[<>≤≥=]", ctx):
+        return True
+    return False
+
+def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
+    """
+    Require: target term present, at least one NON-threshold percent present, and a reduction cue.
+    This avoids extracting from sentences that only describe endpoints/thresholds/proportions.
+    """
+    if not (isinstance(sent, str) and term_re.search(sent) and re_reduction_cue.search(sent)):
+        return False
+    for m in re_pct.finditer(sent):
+        abs_s, abs_e = m.start(), m.end()
+        if not is_threshold_percent_at(abs_s, abs_e, sent):
+            return True
+    return False
+
+# find percent occurrences with absolute indices and normalized strings
+def find_percent_occurrences(sent: str):
+    occ = []
+    for m in re.finditer(re_pct, sent):
+        raw = m.group(0)
+        num = parse_number(m.group(1))
+        if math.isnan(num):
+            continue
+        norm = fmt_pct(abs(num))
+        occ.append({'raw': raw, 'num': num, 'norm': norm, 'start': m.start(), 'end': m.end()})
+    return occ
+
+def find_hint_positions(sent: str, hint: str):
+    positions = []
+    if not hint:
+        return positions
+    hint_l = hint.strip().lower()
+    if not hint_l:
+        return positions
+    s_low = sent.lower()
+    # naive substring search; this works for simple drug names
+    idx = s_low.find(hint_l)
+    while idx != -1:
+        positions.append(idx)
+        idx = s_low.find(hint_l, idx + 1)
+    return positions
+
+# --- window helper (±spaces tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
     L = len(s)
-
-    # Left side
     i = pos - 1
     spaces = 0
-    left_boundary_start = pos  # default
+    left_boundary_start = pos
     while i >= 0 and spaces < n_prev_spaces:
         if s[i] in space_like:
             while i >= 0 and s[i] in space_like:
@@ -98,8 +157,6 @@ def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: in
     while j >= 0 and s[j] not in space_like:
         j -= 1
     start = j + 1
-
-    # Right side
     k = pos
     spaces = 0
     right_boundary_end = pos
@@ -115,8 +172,6 @@ def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: in
     while m < L and s[m] not in space_like:
         m += 1
     end = m
-
-    # Clamp
     start = max(0, min(start, L))
     end = max(start, min(end if end != pos else L, L))
     return s[start:end], start, end
@@ -134,52 +189,59 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
 # -------------------- Core extraction --------------------
 def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
     """
-    Within a qualifying sentence:
-      • Scan the WHOLE SENTENCE for 'from X% to Y%' and record deltas.
-      • For all other % patterns, search ONLY within a ±5-SPACES (inclusive-token) window
-        around each term occurrence.
-      • EXTRA (weight only): If window yields nothing, capture the NEAREST PREVIOUS % within 60 chars.
-
-    Note: For tag_prefix == 'hba1c' we compute relative reduction ((X-Y)/X)*100 for from->to.
+    Extract percent-related matches within a qualifying sentence.
+    Special: for tag_prefix == 'hba1c' compute ((X-Y)/X)*100 for from->to patterns.
+    Also: skip threshold-like percents. If dosages (mg) are present, later selection can prefer matches near highest dose.
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: "from X% to Y%"
+    # 1) WHOLE-SENTENCE: from X% to Y%
     for m in re_fromto.finditer(sent):
-        a = parse_number(m.group(1))  # original X
-        b = parse_number(m.group(2))  # new Y
+        a = parse_number(m.group(1))
+        b = parse_number(m.group(2))
         reduction_val = None
-        if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
+        if (not math.isnan(a)) and (not math.isnan(b)):
             try:
                 if tag_prefix == 'hba1c':
-                    # relative reduction %
-                    reduction_val = ((a - b) / a) * 100.0
+                    if a != 0:
+                        reduction_val = ((a - b) / a) * 100.0  # relative reduction %
                 else:
-                    # keep absolute percentage-point difference for non-HbA1c (legacy behavior)
-                    reduction_val = (a - b)
+                    reduction_val = (a - b)  # absolute pp difference for weight
             except Exception:
                 reduction_val = None
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_val)
 
-    # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
+    # 2) ±5-SPACES window around each target occurrence
     any_window_hit = False
     for hh in term_re.finditer(sent):
         seg, abs_s, _ = window_prev_next_spaces_inclusive_tokens(sent, hh.end(), 5, 5)
 
-        # reduced/decreased/... by X%
+        # reduced/decreased ... by X%
         for m in re_reduce_by.finditer(seg):
+            abs_m_start = abs_s + m.start()
+            abs_m_end = abs_s + m.end()
+            if is_threshold_percent_at(abs_m_start, abs_m_end, sent):
+                continue
             any_window_hit = True
             v = parse_number(m.group(1))
             add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_or_pp_pmSpaces5', [v], v)
 
         # reduction of X%
         for m in re_abs_pp.finditer(seg):
+            abs_m_start = abs_s + m.start()
+            abs_m_end = abs_s + m.end()
+            if is_threshold_percent_at(abs_m_start, abs_m_end, sent):
+                continue
             any_window_hit = True
             v = parse_number(m.group(1))
             add_match(matches, si, abs_s, m, f'{tag_prefix}:pp_word_pmSpaces5', [v], v)
 
-        # ranges like 1.0–1.5% (represent as max)
+        # ranges like 1.0–1.5%
         for m in re_range.finditer(seg):
+            abs_m_start = abs_s + m.start()
+            abs_m_end = abs_s + m.end()
+            if is_threshold_percent_at(abs_m_start, abs_m_end, sent):
+                continue
             any_window_hit = True
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             rep = None if (math.isnan(a) or math.isnan(b)) else max(a, b)
@@ -187,11 +249,15 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
 
         # any stray percent in the window
         for m in re_pct.finditer(seg):
+            abs_m_start = abs_s + m.start()
+            abs_m_end = abs_s + m.end()
+            if is_threshold_percent_at(abs_m_start, abs_m_end, sent):
+                continue
             any_window_hit = True
             v = parse_number(m.group(1))
             add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pmSpaces5', [v], v)
 
-    # 3) Weight safety: nearest previous % within 60 chars if no window hit
+    # 3) Weight safety fallback: nearest previous % within 60 chars if no window hit
     if (tag_prefix == 'weight') and (not any_window_hit):
         for hh in term_re.finditer(sent):
             pos = hh.start()
@@ -202,10 +268,33 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 last_pct = m
             if last_pct is not None:
                 abs_start = left
-                v = parse_number(last_pct.group(1))
-                add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
+                abs_m_start = abs_start + last_pct.start()
+                abs_m_end = abs_start + last_pct.end()
+                if not is_threshold_percent_at(abs_m_start, abs_m_end, sent):
+                    v = parse_number(last_pct.group(1))
+                    add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
 
-    # de-dupe by span
+    # dosage-aware note: collect dosages (mg) in sentence for later preference decisions
+    mg_pattern = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:mg|mg\.)\b', re.IGNORECASE)
+    mg_occurrences = []
+    for mm in mg_pattern.finditer(sent):
+        val = parse_number(mm.group(1))
+        if not math.isnan(val):
+            mg_occurrences.append((val, mm.start()))
+    # If dosages exist and there are matches, filter matches to those closest to highest dose
+    if mg_occurrences and matches:
+        mg_occurrences.sort(key=lambda x: (-x[0], x[1]))
+        highest_mg_val, highest_mg_pos = mg_occurrences[0]
+        def match_center(m): 
+            return (m['span'][0] + m['span'][1]) / 2.0
+        distances = [abs(match_center(m) - highest_mg_pos) for m in matches]
+        if distances:
+            min_dist = min(distances)
+            tol = 8  # allow small tie tolerance in character distance
+            filtered = [m for m, d in zip(matches, distances) if d <= (min_dist + tol)]
+            matches = filtered
+
+    # dedupe by span
     seen = set()
     uniq = []
     for mm in matches:
@@ -217,15 +306,13 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     return uniq
 
 def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
-    """Return (matches, sentences_used) for sentences meeting the criterion."""
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent, term_re):
             continue
         sentences_used.append(sent)
         matches.extend(extract_in_sentence(sent, si, term_re, tag_prefix))
-
-    # dedupe globally by (sentence_index, span)
+    # dedupe globally
     seen, filtered = set(), []
     for mm in matches:
         key = (mm['sentence_index'], mm['span'])
@@ -233,7 +320,6 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
             continue
         seen.add(key)
         filtered.append(mm)
-
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
@@ -244,13 +330,13 @@ col_name   = st.sidebar.text_input('Column with abstracts/text', value='abstract
 drug_col   = st.sidebar.text_input('Column with drug name (optional)', value='drug_name')
 sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
 show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
-use_llm   = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash)', value=True)
+use_llm    = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash)', value=True)
 
 if not uploaded:
     st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
     st.stop()
 
-# read file robustly and handle common encodings
+# read file robustly
 try:
     if uploaded.name.lower().endswith('.csv'):
         try:
@@ -292,40 +378,33 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# LLM prompt & extraction (kept as before; LLM_RULES instructs LLM how to extract)
+# Keep/insert your full LLM_RULES text here. For brevity, a concise rule set is used,
+# but you should paste your original long rules string if you rely on it heavily.
 LLM_RULES = """
-You are an information-extraction assistant. Read the SENTENCE(S) provided and **extract only percentage CHANGES** that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
-
-OUTPUT FORMAT (exact JSON):
-{
-  "extracted": ["1.23%", "0.85%"],      // array of strings (percent with % sign) — values the LLM finds relevant in the sentence(s)
-  "selected_percent": "1.23%"           // single string (percent) the LLM chooses as the *best* value for the sentence(s) and target
-}
-
-[...keep the full rules you used previously...]
+You are an information-extraction assistant. Read the SENTENCE(S) and return JSON:
+{ "extracted": ["1.23%"], "selected_percent": "1.23%" }
+Return only the JSON object. Normalize decimals, ignore SE/CIs/p-values and threshold percents (>=,<=,<,>),
+and prefer within-group drug values when drug hint provided. If the sentence contains 'from X% to Y%' AND the
+TARGET is HbA1c, include the computed relative reduction ((X-Y)/X)*100 and prefer it.
 """
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
-    Returns (extracted_list (strings like '1.23%'), selected_percent (string like '1.23%') )
-    If model is None, returns ([], '')
-
-    Special behavior: If target_label == 'HbA1c' and the sentence contains 'from X% to Y%', compute the
-    relative reduction ((X - Y)/X)*100 and force that computed value to be included in `extracted` and set
-    as `selected_percent`.
+    Returns (extracted_list, selected_percent).
+    Special: for HbA1c, if 'from X% to Y%' present, compute ((X-Y)/X)*100 and force it to be selected.
+    Also prefer candidates closest to drug_hint; if dosages present, prefer closest to highest dose.
     """
     if model is None or not sentence.strip():
         return [], ""
 
-    # Pre-compute computed reductions only for HbA1c target
+    # pre-compute HbA1c from->to reductions (formatted)
     computed_reductions = []
     if target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c'):
         for m_ft in re_fromto.finditer(sentence):
             a = parse_number(m_ft.group(1)); b = parse_number(m_ft.group(2))
             if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
                 try:
-                    reduction_pct = ((a - b) / a) * 100.0
-                    computed_reductions.append(fmt_pct(reduction_pct))
+                    computed_reductions.append(fmt_pct(((a - b)/a) * 100.0))
                 except Exception:
                     pass
 
@@ -340,7 +419,6 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     try:
         resp = model.generate_content(prompt)
         text = (getattr(resp, "text", "") or "").strip()
-        # find JSON object in response
         s, e = text.find("{"), text.rfind("}")
         if s != -1 and e > s:
             data = json.loads(text[s:e+1])
@@ -348,47 +426,102 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
             for x in (data.get("extracted") or []):
                 if isinstance(x, str):
                     x = _norm_percent(x)
-                    # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
-                    if re.search(r'[<>≥≤]', x):
+                    if re.search(r'[<>≥≤]', x):  # ignore threshold-like
                         continue
                     extracted.append(x)
             selected = _norm_percent(data.get("selected_percent", "") or "")
 
-            # If computed_reductions exist (HbA1c case), force preference:
+            # Force preference for computed reductions (HbA1c)
             if computed_reductions:
                 comp = computed_reductions[0]
                 if comp not in extracted:
                     extracted.insert(0, comp)
                 selected = comp
 
-            # convert negative selected to positive absolute (as requested by rules)
+            # If drug_hint provided, prefer candidate closest to drug mention
+            if drug_hint and extracted:
+                percent_occ = find_percent_occurrences(sentence)
+                positions_by_norm = {}
+                for p in percent_occ:
+                    positions_by_norm.setdefault(p['norm'], []).append((p['start'], p['end']))
+                drug_pos_list = find_hint_positions(sentence, drug_hint)
+                if drug_pos_list:
+                    drug_pos = drug_pos_list[0]
+                    best = None; best_dist = None
+                    for cand in extracted:
+                        cand_norm = cand
+                        if cand_norm not in positions_by_norm:
+                            try:
+                                num = parse_number(cand.replace('%',''))
+                                cand_norm = fmt_pct(abs(num))
+                            except:
+                                cand_norm = cand
+                        pos_list = positions_by_norm.get(cand_norm, [])
+                        if not pos_list:
+                            continue
+                        centers = [ (s_e[0] + s_e[1]) / 2.0 for s_e in pos_list ]
+                        dist = min([abs(c - drug_pos) for c in centers])
+                        if (best_dist is None) or (dist < best_dist):
+                            best_dist = dist
+                            best = cand
+                    if best is not None:
+                        selected = best
+
+            # If dosages in sentence, prefer candidate closest to highest dose (unless computed_reduction forced)
+            if (not computed_reductions) and extracted:
+                # detect mg doses
+                mg_pattern = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:mg|mg\.)\b', re.IGNORECASE)
+                mg_occurrences = []
+                for mm in mg_pattern.finditer(sentence):
+                    val = parse_number(mm.group(1))
+                    if not math.isnan(val):
+                        mg_occurrences.append((val, mm.start()))
+                if mg_occurrences:
+                    mg_occurrences.sort(key=lambda x: (-x[0], x[1]))
+                    highest_mg_val, highest_mg_pos = mg_occurrences[0]
+                    percent_occ = find_percent_occurrences(sentence)
+                    positions_by_norm = {}
+                    for p in percent_occ:
+                        positions_by_norm.setdefault(p['norm'], []).append((p['start'], p['end']))
+                    best = None; best_dist = None
+                    for cand in extracted:
+                        cand_norm = cand
+                        if cand_norm not in positions_by_norm:
+                            try:
+                                num = parse_number(cand.replace('%',''))
+                                cand_norm = fmt_pct(abs(num))
+                            except:
+                                cand_norm = cand
+                        pos_list = positions_by_norm.get(cand_norm, [])
+                        if not pos_list:
+                            continue
+                        centers = [(s_e[0]+s_e[1]) / 2.0 for s_e in pos_list]
+                        dist = min([abs(c - highest_mg_pos) for c in centers])
+                        if (best_dist is None) or (dist < best_dist):
+                            best_dist = dist
+                            best = cand
+                    if best is not None:
+                        selected = best
+
+            # final normalization: make selected positive absolute
             if selected:
                 try:
-                    num = parse_number(selected.replace('%', ''))
+                    num = parse_number(selected.replace('%',''))
                     if not math.isnan(num):
-                        num = abs(num)
-                        selected = fmt_pct(num)
+                        selected = fmt_pct(abs(num))
                 except:
                     pass
 
-            # Only keep normalized percent strings in extracted
+            # keep only normalized percent strings in extracted
             extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
             return extracted, selected
     except Exception:
-        # LLM failed; return empty so selected% remains empty
         return [], ""
 
     return [], ""
 
 # -------------------- Scoring helpers --------------------
 def compute_a1c_score(selected_pct_str: str):
-    """Scores for A1c:
-    5: >2.2%
-    4: 1.8%-2.1%
-    3: 1.2%-1.7%
-    2: 0.8%-1.1%
-    1: <0.8%
-    """
     if not selected_pct_str:
         return ""
     try:
@@ -408,13 +541,6 @@ def compute_a1c_score(selected_pct_str: str):
     return ""
 
 def compute_weight_score(selected_pct_str: str):
-    """Scores for weight:
-    5: >=22%
-    4: 16-21.9%
-    3: 10-15.9%
-    2: 5-9.9%
-    1: <5%
-    """
     if not selected_pct_str:
         return ""
     try:
@@ -433,7 +559,7 @@ def compute_weight_score(selected_pct_str: str):
         return 1
     return ""
 
-# -------------------- Processing function (note _model to avoid caching errors) --------------------
+# -------------------- Processing function --------------------
 @st.cache_data
 def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
     rows = []
@@ -442,54 +568,47 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if not isinstance(text_orig, str):
             text_orig = '' if pd.isna(text_orig) else str(text_orig)
 
-        # Run regex extraction to produce the 'sentence' columns (only sentences that meet the strict criteria)
+        # regex extraction
         hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c')
         wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight')
 
-        # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
             if 'from-to' in t:
-                # present as percent (for HbA1c it's relative reduction, for weight it's kept as stored)
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
         wt_regex_vals  = [fmt_extracted(m) for m in wt_matches]
 
-        # Build sentence strings (join qualifying sentences with ' | ')
         sentence_str = ' | '.join(hba_sentences) if hba_sentences else ''
         weight_sentence_str = ' | '.join(wt_sentences) if wt_sentences else ''
 
-        # LLM extraction: read from the sentence column and produce LLM extracted + selected %
         drug_hint = ""
         if drug_col_name and drug_col_name in df_in.columns:
             drug_hint = str(row.get(drug_col_name, '') or "")
 
-        # HbA1c LLM
+        # LLM extraction
         hba_llm_extracted, hba_selected = ([], "")
         if _model is not None and sentence_str:
             hba_llm_extracted, hba_selected = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
 
-        # Weight LLM
         wt_llm_extracted, wt_selected = ([], "")
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
-        # If LLM extracted is empty, we must ensure selected remains empty (explicit requirement)
         if not hba_llm_extracted:
             hba_selected = ""
         if not wt_llm_extracted:
             wt_selected = ""
 
-        # Ensure selected% is formatted and positive
         def normalize_selected(s):
             if not s:
                 return ""
             s2 = s.replace('%', '').replace(',', '.').strip()
             try:
                 v = float(s2)
-                v = abs(v)  # make positive on user's request
+                v = abs(v)
                 return fmt_pct(v)
             except:
                 return ""
@@ -497,7 +616,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         hba_selected = normalize_selected(hba_selected)
         wt_selected  = normalize_selected(wt_selected)
 
-        # Scores
         a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(wt_selected)
 
@@ -518,7 +636,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
     out = pd.DataFrame(rows)
 
-    # keep row if hba or weight has extracted matches (regex), or if LLM extracted exist (we assume we want rows with any data)
     def has_items(x):
         return isinstance(x, list) and len(x) > 0
 
@@ -527,7 +644,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
     mask_keep = mask_hba | mask_wt
     out = out[mask_keep].reset_index(drop=True)
 
-    # counts for UI
     out.attrs['counts'] = dict(
         kept=int(mask_keep.sum()),
         total=int(len(mask_keep)),
@@ -535,13 +651,12 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         wt_only=int((mask_wt & ~mask_hba).sum()),
         both=int((mask_hba & mask_wt).sum()),
     )
-
     return out
 
-# Run processing (note we pass `model` in but process_df signature uses _model — avoids caching hash error)
+# Run processing
 out_df = process_df(model, df, col_name, drug_col)
 
-# -------------------- Reorder columns: place LLM columns BESIDE regex columns --------------------
+# reorder columns
 def insert_after(cols, after, names):
     if after not in cols:
         return cols
@@ -556,10 +671,9 @@ display_df = out_df.copy()
 cols = list(display_df.columns)
 cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
 cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
-# keep user columns order + these additions
 display_df = display_df[cols]
 
-# -------------------- Show results --------------------
+# show results
 st.write("### Results (first 200 rows shown)")
 if not show_debug:
     for c in ['reductions_pp', 'reduction_types', 'weight_reductions_pp', 'weight_reduction_types']:
@@ -568,7 +682,6 @@ if not show_debug:
 
 st.dataframe(display_df.head(200))
 
-# counts
 counts = out_df.attrs.get('counts', None)
 if counts:
     kept, total = counts['kept'], counts['total']
@@ -577,7 +690,7 @@ if counts:
         f"HbA1c-only: {counts['hba_only']}, Weight-only: {counts['wt_only']}, Both: {counts['both']}"
     )
 
-# -------------------- Download --------------------
+# Download
 @st.cache_data
 def to_excel_bytes(df_out):
     buffer = BytesIO()
