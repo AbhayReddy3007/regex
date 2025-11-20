@@ -1,6 +1,6 @@
 # streamlit_hba1c_weight_llm.py
 # Updated: compute relative reduction for 'from X% to Y%' ONLY for HbA1c (not weight),
-# and force the LLM to extract & select that relative reduction when present.
+# Force the LLM to select the highest end when a range like "1.0–1.5%" is present.
 
 import re
 import math
@@ -313,6 +313,8 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     Special behavior: If target_label == 'HbA1c' and the sentence contains 'from X% to Y%', compute the
     relative reduction ((X - Y)/X)*100 and force that computed value to be included in `extracted` and set
     as `selected_percent`.
+    Additionally: if the LLM returns a range (e.g. "1.0–1.5%") anywhere in its extracted list, we force the
+    selected percent to be the highest endpoint of that range (converted to a single percent like "1.5%").
     """
     if model is None or not sentence.strip():
         return [], ""
@@ -344,17 +346,67 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         s, e = text.find("{"), text.rfind("}")
         if s != -1 and e > s:
             data = json.loads(text[s:e+1])
-            extracted = []
+
+            # keep raw extracted strings first (before normalizing ranges)
+            raw_extracted = []
             for x in (data.get("extracted") or []):
                 if isinstance(x, str):
-                    x = _norm_percent(x)
-                    # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
-                    if re.search(r'[<>≥≤]', x):
-                        continue
-                    extracted.append(x)
+                    raw_extracted.append(x.strip())
+
+            # normalize and filter extracted items (convert simple numbers to percent strings)
+            extracted = []
+            for x in raw_extracted:
+                xn = _norm_percent(x)
+                # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
+                if re.search(r'[<>≥≤]', xn):
+                    continue
+                extracted.append(xn)
+
+            # normalize selected
             selected = _norm_percent(data.get("selected_percent", "") or "")
 
-            # If computed_reductions exist (HbA1c case), force preference:
+            # --- begin: normalize any RANGE-like LLM outputs to the highest endpoint ---
+            # Accepts forms like "1.0-1.5%", "1.0–1.5%", "1.0 – 1.5%", "1.0 to 1.5%"
+            range_re = re.compile(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:-|–|—|\sto\s|\s–\s)\s*([+-]?\d+(?:[.,·]\d+)?)\s*%?$', FLAGS)
+
+            def range_to_max_percent(s: str):
+                """If s is a range, return the max as a normalized percent string like '1.500%'.
+                   Otherwise return s unchanged."""
+                if not isinstance(s, str):
+                    return s
+                s_strip = s.strip()
+                m = range_re.search(s_strip)
+                if not m:
+                    return s_strip
+                a = parse_number(m.group(1))
+                b = parse_number(m.group(2))
+                if math.isnan(a) or math.isnan(b):
+                    return s_strip
+                return fmt_pct(max(a, b))
+
+            # apply conversion to all extracted items (but keep raw_extracted for range detection)
+            extracted = [range_to_max_percent(x) for x in extracted]
+
+            # If any raw_extracted item was a range, force selected to the highest endpoint of that range
+            range_present = any(range_re.search(x) for x in raw_extracted)
+            if range_present:
+                # compute max across all converted extracted items
+                max_val = None
+                for ex in extracted:
+                    if not ex:
+                        continue
+                    try:
+                        num = parse_number(ex.replace('%', ''))
+                        if math.isnan(num):
+                            continue
+                        if max_val is None or num > max_val:
+                            max_val = num
+                    except:
+                        continue
+                if max_val is not None:
+                    selected = fmt_pct(max_val)
+
+            # If computed_reductions exist (HbA1c case), force preference: computed reduction overrides LLM
             if computed_reductions:
                 comp = computed_reductions[0]
                 if comp not in extracted:
