@@ -1,7 +1,6 @@
 # streamlit_hba1c_weight_llm.py
 # Updated: compute relative reduction for 'from X% to Y%' ONLY for HbA1c (not weight),
-# Force the LLM to select the highest end when a range like "1.0–1.5%" is present,
-# prefer highest dose's range when multiple doses appear, and finally pick the numeric max.
+# Force the LLM to select the highest end when a range like "1.0–1.5%" is present.
 
 import re
 import math
@@ -218,11 +217,40 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     return uniq
 
 def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
-    """Return (matches, sentences_used) for sentences meeting the criterion."""
+    """Return (matches, sentences_used) for sentences meeting the criterion.
+
+    NOTE: previously we only included sentences that matched the strict
+    `sentence_meets_criterion` test (term + % + reduction cue). That caused
+    us to miss cases where a sentence contains a `from X% to Y%` pattern but
+    *doesn't* explicitly mention the target term (e.g. "HbA1c") in the same
+    sentence. To fix that, we also include any sentence that contains a
+    `from X% to Y%` span when the target term appears in a neighbouring
+    sentence (previous or next). This keeps the strict filter for most
+    sentences but captures the common "from X% to Y%" phrasing.
+    """
     matches, sentences_used = [], []
-    for si, sent in enumerate(split_sentences(text)):
-        if not sentence_meets_criterion(sent, term_re):
+    sents = split_sentences(text)
+    for si, sent in enumerate(sents):
+        keep = False
+        if sentence_meets_criterion(sent, term_re):
+            keep = True
+        else:
+            # If this sentence contains a "from X% to Y%" but didn't meet the strict
+            # criterion, include it if the target term is present nearby (prev/next)
+            if re_fromto.search(sent):
+                # check same sentence for target term first
+                if term_re.search(sent):
+                    keep = True
+                else:
+                    # check previous and next sentences for the target term
+                    prev_has = (si > 0) and bool(term_re.search(sents[si-1]))
+                    next_has = (si+1 < len(sents)) and bool(term_re.search(sents[si+1]))
+                    if prev_has or next_has:
+                        keep = True
+
+        if not keep:
             continue
+
         sentences_used.append(sent)
         matches.extend(extract_in_sentence(sent, si, term_re, tag_prefix))
 
@@ -311,12 +339,11 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     Returns (extracted_list (strings like '1.23%'), selected_percent (string like '1.23%') )
     If model is None, returns ([], '')
 
-    Behavior:
-    - computed_reductions (from X% to Y%) override other logic for HbA1c.
-    - ranges are normalized to their high endpoint and the maximum is chosen.
-    - dose-aware: prefer highest dose's nearby range/percent if multiple doses.
-    - finally, if extracted values exist, selected_percent is set to the numeric maximum across them
-      (unless computed_reductions override).
+    Special behavior: If target_label == 'HbA1c' and the sentence contains 'from X% to Y%', compute the
+    relative reduction ((X - Y)/X)*100 and force that computed value to be included in `extracted` and set
+    as `selected_percent`.
+    Additionally: if the LLM returns a range (e.g. "1.0–1.5%") anywhere in its extracted list, we force the
+    selected percent to be the highest endpoint of that range (converted to a single percent like "1.5%").
     """
     if model is None or not sentence.strip():
         return [], ""
@@ -346,110 +373,53 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         text = (getattr(resp, "text", "") or "").strip()
         # find JSON object in response
         s, e = text.find("{"), text.rfind("}")
-        if s == -1 or e <= s:
-            return [], ""
-        data = json.loads(text[s:e+1])
+        if s != -1 and e > s:
+            data = json.loads(text[s:e+1])
 
-        # keep raw extracted strings first (before normalizing ranges)
-        raw_extracted = []
-        for x in (data.get("extracted") or []):
-            if isinstance(x, str):
-                raw_extracted.append(x.strip())
+            # keep raw extracted strings first (before normalizing ranges)
+            raw_extracted = []
+            for x in (data.get("extracted") or []):
+                if isinstance(x, str):
+                    raw_extracted.append(x.strip())
 
-        # normalize and filter extracted items (convert simple numbers to percent strings)
-        extracted = []
-        for x in raw_extracted:
-            xn = _norm_percent(x)
-            # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
-            if re.search(r'[<>≥≤]', xn):
-                continue
-            extracted.append(xn)
-
-        # normalize selected (LLM's pick); we'll override later if rules require
-        selected = _norm_percent(data.get("selected_percent", "") or "")
-
-        # --- normalize any RANGE-like LLM outputs to the highest endpoint ---
-        range_re = re.compile(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:-|–|—|\sto\s|\s–\s)\s*([+-]?\d+(?:[.,·]\d+)?)\s*%?$', FLAGS)
-
-        def range_to_max_percent(s: str):
-            if not isinstance(s, str):
-                return s
-            s_strip = s.strip()
-            m = range_re.search(s_strip)
-            if not m:
-                return s_strip
-            a = parse_number(m.group(1))
-            b = parse_number(m.group(2))
-            if math.isnan(a) or math.isnan(b):
-                return s_strip
-            return fmt_pct(max(a, b))
-
-        extracted = [range_to_max_percent(x) for x in extracted]
-
-        # If any raw_extracted item was a range, set selected to highest endpoint across extracted
-        range_present = any(range_re.search(x) for x in raw_extracted)
-        if range_present:
-            max_val = None
-            for ex in extracted:
-                if not ex:
+            # normalize and filter extracted items (convert simple numbers to percent strings)
+            extracted = []
+            for x in raw_extracted:
+                xn = _norm_percent(x)
+                # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
+                if re.search(r'[<>≥≤]', xn):
                     continue
-                try:
-                    num = parse_number(ex.replace('%', ''))
-                    if math.isnan(num):
-                        continue
-                    if max_val is None or num > max_val:
-                        max_val = num
-                except:
-                    continue
-            if max_val is not None:
-                selected = fmt_pct(max_val)
+                extracted.append(xn)
 
-        # Dose-aware: if sentence mentions multiple doses (e.g. "0.5 mg" and "1.0 mg"), prefer highest dose
-        dose_re = re.compile(r'(\d+(?:[.,]\d+)?)\s*mg', FLAGS)
-        if target_label.lower().startswith('hba1c'):
-            dose_spans = []
-            for dm in dose_re.finditer(sentence):
-                try:
-                    dose_val = parse_number(dm.group(1))
-                    dose_spans.append((dose_val, dm.start(), dm.end()))
-                except:
-                    continue
+            # normalize selected
+            selected = _norm_percent(data.get("selected_percent", "") or "")
 
-            if dose_spans:
-                dose_spans.sort(key=lambda x: x[0], reverse=True)  # highest dose first
-                found_for_highest = None
-                for dose_val, ds, de in dose_spans:
-                    # search forward up to 120 chars for a range or percent
-                    look = sentence[de:de+120]
-                    # prefer a range
-                    m_range = range_re.search(look)
-                    if m_range:
-                        a = parse_number(m_range.group(1)); b = parse_number(m_range.group(2))
-                        if not (math.isnan(a) or math.isnan(b)):
-                            found_for_highest = max(a, b)
-                            break
-                    # otherwise first percent
-                    m_pct = re_pct.search(look)
-                    if m_pct:
-                        v = parse_number(m_pct.group(1))
-                        if not math.isnan(v):
-                            found_for_highest = v
-                            break
-                if found_for_highest is not None:
-                    sel_pct = fmt_pct(found_for_highest)
-                    if sel_pct not in extracted:
-                        extracted.insert(0, sel_pct)
-                    selected = sel_pct
+            # --- begin: normalize any RANGE-like LLM outputs to the highest endpoint ---
+            # Accepts forms like "1.0-1.5%", "1.0–1.5%", "1.0 – 1.5%", "1.0 to 1.5%"
+            range_re = re.compile(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:-|–|—|\sto\s|\s–\s)\s*([+-]?\d+(?:[.,·]\d+)?)\s*%?$', FLAGS)
 
-        # If computed_reductions exist (HbA1c case), prefer computed reduction (overrides all)
-        if computed_reductions:
-            comp = computed_reductions[0]
-            if comp not in extracted:
-                extracted.insert(0, comp)
-            selected = comp
-        else:
-            # No computed override: if there are extracted values, pick the numeric max across them
-            if extracted:
+            def range_to_max_percent(s: str):
+                """If s is a range, return the max as a normalized percent string like '1.500%'.
+                   Otherwise return s unchanged."""
+                if not isinstance(s, str):
+                    return s
+                s_strip = s.strip()
+                m = range_re.search(s_strip)
+                if not m:
+                    return s_strip
+                a = parse_number(m.group(1))
+                b = parse_number(m.group(2))
+                if math.isnan(a) or math.isnan(b):
+                    return s_strip
+                return fmt_pct(max(a, b))
+
+            # apply conversion to all extracted items (but keep raw_extracted for range detection)
+            extracted = [range_to_max_percent(x) for x in extracted]
+
+            # If any raw_extracted item was a range, force selected to the highest endpoint of that range
+            range_present = any(range_re.search(x) for x in raw_extracted)
+            if range_present:
+                # compute max across all converted extracted items
                 max_val = None
                 for ex in extracted:
                     if not ex:
@@ -465,19 +435,26 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 if max_val is not None:
                     selected = fmt_pct(max_val)
 
-        # final normalization: ensure selected is positive & formatted
-        if selected:
-            try:
-                num = parse_number(selected.replace('%', ''))
-                if not math.isnan(num):
-                    selected = fmt_pct(abs(num))
-            except:
-                pass
+            # If computed_reductions exist (HbA1c case), force preference: computed reduction overrides LLM
+            if computed_reductions:
+                comp = computed_reductions[0]
+                if comp not in extracted:
+                    extracted.insert(0, comp)
+                selected = comp
 
-        # Only keep normalized percent strings in extracted
-        extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-        return extracted, selected
+            # convert negative selected to positive absolute (as requested by rules)
+            if selected:
+                try:
+                    num = parse_number(selected.replace('%', ''))
+                    if not math.isnan(num):
+                        num = abs(num)
+                        selected = fmt_pct(num)
+                except:
+                    pass
 
+            # Only keep normalized percent strings in extracted
+            extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
+            return extracted, selected
     except Exception:
         # LLM failed; return empty so selected% remains empty
         return [], ""
