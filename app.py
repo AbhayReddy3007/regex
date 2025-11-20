@@ -1,6 +1,13 @@
 # streamlit_hba1c_weight_llm.py
-# LLM is instructed to compute relative reductions for 'from X% to Y%' (HbA1c).
-# The code validates the LLM output and forces the correct relative reduction if the LLM fails.
+# Complete file — includes full LLM_RULES and a robust pipeline that:
+# - instructs the LLM to compute relative reductions for 'from X% to Y%' (HbA1c)
+# - validates the LLM output and forces the correct computed relative reduction if the LLM fails
+# - normalizes ranges to their high endpoint, prefers highest dose when multiple doses,
+# - returns final selected% consistently formatted.
+#
+# Usage:
+#  - Hard-code your Gemini API key into API_KEY or leave blank to run without the model.
+#  - Save as streamlit_hba1c_weight_llm.py and run: `streamlit run streamlit_hba1c_weight_llm.py`
 
 import re
 import math
@@ -11,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = ""   # <- replace with your real key
+API_KEY = ""   # <- replace with your real key if you want LLM enabled
 # =========================================================================
 
 # Lazy Gemini import so the app still runs without the package
@@ -310,12 +317,12 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# -------------------- LLM RULES (now instructs LLM to compute relative reductions for from->to) --------------------
+# -------------------- FULL LLM RULES (copy-paste into prompt) --------------------
 LLM_RULES = """
 You are an information-extraction assistant. Your job is to read the SENTENCE(S) provided
-and extract ONLY percentage CHANGES related to the specified TARGET:
+and extract ONLY percentage CHANGES related to the specified TARGET.
 
-- TARGET will be one of: "HbA1c", "A1c", or "Body weight".
+TARGET will be one of: "HbA1c", "A1c", or "Body weight".
 
 Return STRICT JSON only (no explanations, no commentary), in this exact structure:
 
@@ -324,134 +331,78 @@ Return STRICT JSON only (no explanations, no commentary), in this exact structur
   "selected_percent": "...%"
 }
 
-==============================================================
-= CORE BEHAVIOR
-==============================================================
+CORE BEHAVIOR:
+1) Extract only percentage CHANGE values. These include reductions, decreases, declines,
+   drops, percentage-point reductions, ranges like "1.2–1.5%", and computed changes.
+   Do NOT return baseline percentages unless they represent a change (e.g., part of "from X% to Y%").
 
-1. **Extract only percentage CHANGE values.**
-   - These include:
-       • reductions
-       • decreases
-       • declines
-       • drops
-       • percentage-point reductions
-       • ranges like “1.2–1.5%”
-       • computed changes (explained below)
-   - DO NOT return baseline percentages unless they represent a change.
+2) Normalize extracted percentage values:
+   - Must end with '%' and be numeric (no '<', '>', '≥', '≤').
+   - Ranges like "1.2–1.5%" must be treated as two values: 1.2% and 1.5%.
 
-2. **Normalize all extracted percentage values:**
-   - They must end with a percent sign (%).
-   - They must be numeric (no "<", ">", "≥", "≤", etc.).
-   - For ranges like "1.2–1.5%", treat them as TWO values: 1.2% and 1.5%.
-
-3. **Your output must contain:**
-   - "extracted": an array of all valid extracted percentages (strings with %)
+3) Output must contain:
+   - "extracted": array of all valid extracted percentages (strings with %)
    - "selected_percent": the SINGLE best value for the target (string with %)
 
-==============================================================
-= SPECIAL RULE FOR 'from X% to Y%' (HbA1c / A1c only)
-==============================================================
+SPECIAL RULE FOR 'from X% to Y%' (HbA1c / A1c only):
+Whenever you see "from X% to Y%" (variants allowed, spaces etc.) AND TARGET is "HbA1c" or "A1c":
 
-Whenever you see a phrase like:
+  - YOU MUST COMPUTE THE RELATIVE REDUCTION:
+      relative_reduction = ((X - Y) / X) * 100
 
-- "from X% to Y%"
-- "from X % to Y %"
-- "from X% → Y%"
-
-AND the TARGET is “HbA1c” or “A1c”:
-
-### YOU MUST COMPUTE THE RELATIVE REDUCTION:
-
-    relative_reduction = ((X - Y) / X) * 100
-
-And then:
-
-- Format it as a percentage (e.g., 13.415%).
-- Include it in "extracted".
-- Set it as the "selected_percent".
-
-### DO NOT return the absolute difference (X - Y).  
-Always return the RELATIVE reduction.
+  - Format it as a percent with a '%' sign (3 decimal places is fine, e.g. 13.415%).
+  - Include that computed percent in "extracted".
+  - Set it as "selected_percent".
+  - DO NOT return the absolute difference (X - Y) as the selected_percent.
 
 Examples:
+  - "HbA1c improved from 8.2% to 7.1%." -> "selected_percent": "13.415%"
+  - "HbA1c declined from 7.80% to 6.90%." -> "selected_percent": "11.538%"
 
-Sentence: "HbA1c improved from 8.2% to 7.1%."
-    X = 8.2, Y = 7.1
-    relative = ((8.2 - 7.1) / 8.2) * 100 = 13.415%
-    Output must include: "13.415%"
-    selected_percent must be: "13.415%"
+RANGES:
+- For ranges like "1.2–1.5%", include both endpoints in "extracted" (1.2%, 1.5%).
+- Prefer the HIGHER endpoint when choosing selected_percent, UNLESS a computed relative reduction applies.
 
-Sentence: "HbA1c levels declined from 7.80% to 6.90%."
-    X = 7.80, Y = 6.90
-    relative = ((7.8 - 6.9) / 7.8) * 100 = 11.538%
-    selected_percent must be: "11.538%"
+MULTIPLE DOSES OR MULTIPLE CHANGES:
+- If multiple doses appear (0.5 mg, 1 mg, ...), include all changes.
+- Prefer the change for the HIGHEST DOSE when choosing selected_percent, or the primary finding,
+  or the computed relative reduction (which overrides).
 
-==============================================================
-= RANGES
-==============================================================
-
-If the sentence lists ranges like:
-- “1.2–1.5%”
-- “1.4 to 1.8%”
-- “1.4—1.8%”
-
-You must:
-1. Convert the range into its TWO numeric values.
-2. Include BOTH in "extracted".
-3. Prefer the HIGHER value when choosing "selected_percent", UNLESS the computed
-   relative reduction (explained above) applies — in which case the computed value wins.
-
-==============================================================
-= MULTIPLE DOSES OR MULTIPLE CHANGES
-==============================================================
-
-If the sentence describes multiple doses (e.g., 0.5 mg, 1 mg, 2 mg), extract all changes.
-Choose the change value corresponding to:
-
-- the **highest dose** mentioned,
-OR
-- the explicitly stated primary finding,
-OR
-- the computed relative reduction (if present), which OVERRIDES all others.
-
-==============================================================
-= WHAT NOT TO RETURN
-==============================================================
-
-Do NOT output:
-- Baseline percentages (e.g., “8.2%”) unless they are part of a change like “from X% to Y%”.
-- Percentages related to unrelated outcomes.
+DO NOT RETURN:
+- Baseline percentages unrelated to a change.
 - Percentages without change context.
 - Thresholds (e.g., "<7%").
 
-==============================================================
-= OUTPUT FORMAT (JSON ONLY)
-==============================================================
-
-Return ONLY:
-
+OUTPUT FORMAT (JSON ONLY):
 {
   "extracted": ["...%", "...%"],
   "selected_percent": "...%"
 }
-
-No text outside the JSON.
 """
-
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
-    Returns (extracted_list (strings like '1.23%'), selected_percent (string like '1.23%') )
-    Behavior:
-    - If sentence contains a from->to pattern for HbA1c, the LLM is instructed to compute relative reduction.
-    - After model returns, the function validates: if a valid from->to exists and the LLM did not return
-      the computed relative reduction, the code WILL compute and force the correct relative reduction to
-      ensure accuracy.
+    Call the LLM (if available) with LLM_RULES and the sentence. After the model responds,
+    validate results — and if the sentence contains a 'from X% to Y%' for HbA1c/A1c,
+    force the computed relative reduction ((X - Y)/X)*100 into the returned values
+    if the model didn't follow instructions.
     """
     if model is None or not sentence.strip():
         return [], ""
 
-    # Build prompt
+    # Pre-compute authoritative computed reductions (for validation/forcing)
+    computed_reductions = []
+    if (target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c')):
+        for m_ft in re_fromto.finditer(sentence):
+            a = parse_number(m_ft.group(1)); b = parse_number(m_ft.group(2))
+            if not (math.isnan(a) or math.isnan(b)) and a != 0:
+                try:
+                    rel = ((a - b) / a) * 100.0
+                    computed_reductions.append(fmt_pct(rel))
+                except Exception:
+                    pass
+
+    # Build and send prompt
     prompt = (
         f"TARGET: {target_label}\n"
         + (f"DRUG_HINT: {drug_hint}\n" if drug_hint else "")
@@ -460,14 +411,14 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         + "Return JSON only.\n"
     )
 
-    # Call model (if available)
+    text = ""
     try:
         resp = model.generate_content(prompt) if model is not None else None
         text = (getattr(resp, "text", "") or "").strip() if resp is not None else ""
     except Exception:
         text = ""
 
-    # parse JSON from model output if present
+    # parse LLM JSON if present
     extracted = []
     selected = ""
     try:
@@ -486,40 +437,18 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         extracted = []
         selected = ""
 
-    # --- Validation & enforced-correctness for HbA1c from->to ---
-    # If the SENTENCE contains a 'from X% to Y%' for HbA1c, compute the relative reduction expected.
-    computed_reductions = []
-    if (target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c')):
-        for m_ft in re_fromto.finditer(sentence):
-            a = parse_number(m_ft.group(1)); b = parse_number(m_ft.group(2))
-            if not (math.isnan(a) or math.isnan(b)) and a != 0:
-                try:
-                    rel = ((a - b) / a) * 100.0
-                    computed_reductions.append(fmt_pct(rel))
-                except Exception:
-                    pass
-
-    # If LLM didn't return anything, keep as empty
-    # But if computed_reductions exist, we strongly prefer the computed value:
+    # If computed reductions exist for HbA1c/A1c, force the computed value (validation step)
     if computed_reductions:
-        comp = computed_reductions[0]
-        # If LLM already returned the same computed value, keep it.
-        if comp in extracted and selected == comp:
-            return extracted, selected
-        # If LLM failed to return the computed value, we *force* it (but only after instructing LLM).
-        # This guarantees correctness while still having LLM do the work when it follows instructions.
-        # We insert comp at front of extracted and set selected to comp.
+        comp = computed_reductions[0]  # prefer first computed reduction found
         if comp not in extracted:
             extracted.insert(0, comp)
         selected = comp
-        # Return forced computed result
         return extracted, selected
 
-    # --- No from->to computed case: postprocess LLM outputs (ranges -> max endpoint, dose-aware, final max) ---
-
-    # normalize ranges in extracted to their highest endpoint
+    # No computed 'from->to' case: normalize LLM outputs (ranges -> max endpoint, dose-aware, final-max)
+    # Normalize any ranges in extracted to their highest endpoint
     range_re = re.compile(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:-|–|—|\sto\s|\s–\s)\s*([+-]?\d+(?:[.,·]\d+)?)\s*%?$', FLAGS)
-    norm_extracted = []
+    normalized = []
     for x in extracted:
         if not isinstance(x, str):
             continue
@@ -527,18 +456,49 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if m:
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             if not (math.isnan(a) or math.isnan(b)):
-                norm_extracted.append(fmt_pct(max(a, b)))
+                normalized.append(fmt_pct(max(a, b)))
             else:
-                norm_extracted.append(x)
+                normalized.append(x)
         else:
-            norm_extracted.append(x)
-    extracted = norm_extracted
+            normalized.append(x)
+    extracted = normalized
 
-    # If selected is not present or not normalized, set to normalized form
+    # Dose-aware preference (try to find highest dose nearby)
+    dose_re = re.compile(r'(\d+(?:[.,]\d+)?)\s*mg', FLAGS)
+    if target_label.lower().startswith('hba1c'):
+        dose_spans = []
+        for dm in dose_re.finditer(sentence):
+            try:
+                dose_val = parse_number(dm.group(1))
+                dose_spans.append((dose_val, dm.start(), dm.end()))
+            except:
+                continue
+        if dose_spans:
+            dose_spans.sort(key=lambda x: x[0], reverse=True)
+            found_for_highest = None
+            for dose_val, ds, de in dose_spans:
+                look = sentence[de:de+120]
+                m_range = range_re.search(look)
+                if m_range:
+                    a = parse_number(m_range.group(1)); b = parse_number(m_range.group(2))
+                    if not (math.isnan(a) or math.isnan(b)):
+                        found_for_highest = max(a, b)
+                        break
+                m_pct = re_pct.search(look)
+                if m_pct:
+                    v = parse_number(m_pct.group(1))
+                    if not math.isnan(v):
+                        found_for_highest = v
+                        break
+            if found_for_highest is not None:
+                sel_pct = fmt_pct(found_for_highest)
+                if sel_pct not in extracted:
+                    extracted.insert(0, sel_pct)
+                selected = sel_pct
+
+    # Final selection if still empty: pick numeric max across extracted
     selected = _norm_percent(selected)
-
-    # If selected empty and extracted present, pick numeric max across extracted
-    if (not selected) and extracted:
+    if not selected and extracted:
         max_val = None
         for ex in extracted:
             try:
@@ -552,9 +512,8 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if max_val is not None:
             selected = fmt_pct(max_val)
 
-    # Final cleanup: only keep percent-formatted extracted
+    # Final cleanup: keep only percent-formatted extracted items
     extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-
     return extracted, selected
 
 # -------------------- Scoring helpers --------------------
