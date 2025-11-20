@@ -5,3 +5,5 @@ When adjusted for age and BMI, body weight and HbA1c reduction were not signific
 This study assessed the real-world effectiveness of available GLP-1 RAs in Romania on glycemic control, body weight reduction (BWR), and waist circumference (WC) in T2DM patients with excess weight.Methods: A prospective observational study was conducted on 311 adults with T2DM (glycated hemoglobin (HbA1c) > 7.2%, body mass index (BMI) ≥ 25 kg/m2). | Dulaglutide had the most significant impact on HbA1c (-6.69 ± 0.91%), while injectable semaglutide led to the most notable BWR (-4.60 ± 2.74 kg) and WC reduction, especially among male patients.
 
 From a baseline range of 8.1-8.7 %, 0.5 mg dose lowered HbA1c by 1.2-1.5 %, while the 1.0 mg dose reduced it by 1.4-1.8 %.
+
+HbA1c reductions ranged from -0.63% ± 0.03% (lixisenatide, 20 μg q.d.) to -1.79% ± 0.09% (tirzepatide, 15 mg q.w.; p < 0.0001).
