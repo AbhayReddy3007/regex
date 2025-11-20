@@ -1,6 +1,7 @@
 # streamlit_hba1c_weight_llm.py
 # Updated: compute relative reduction for 'from X% to Y%' ONLY for HbA1c (not weight),
-# Force the LLM to select the highest end when a range like "1.0–1.5%" is present.
+# Force the LLM to select the highest end when a range like "1.0–1.5%" is present,
+# and prefer highest-dose nearby ranges when multiple doses are present in the sentence.
 
 import re
 import math
@@ -315,6 +316,11 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     as `selected_percent`.
     Additionally: if the LLM returns a range (e.g. "1.0–1.5%") anywhere in its extracted list, we force the
     selected percent to be the highest endpoint of that range (converted to a single percent like "1.5%").
+
+    Dose-aware behavior:
+    - If sentence mentions multiple doses (e.g. "0.5 mg" and "1.0 mg") the code will prefer the highest dose
+      and look for the nearest following range/percent (within ~120 chars). If a range is found for that dose,
+      its highest endpoint will be selected.
     """
     if model is None or not sentence.strip():
         return [], ""
@@ -412,6 +418,48 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 if comp not in extracted:
                     extracted.insert(0, comp)
                 selected = comp
+
+            # --- begin: dose-aware extraction (after range-normalization but before final selection) ---
+            # If sentence mentions multiple doses (e.g. "0.5 mg" and "1.0 mg") prefer the highest dose's nearby range
+            dose_re = re.compile(r'(\d+(?:[.,]\d+)?)\s*mg', FLAGS)
+            if target_label.lower().startswith('hba1c'):
+                dose_spans = []
+                for dm in dose_re.finditer(sentence):
+                    try:
+                        dose_val = parse_number(dm.group(1))
+                        dose_spans.append((dose_val, dm.start(), dm.end()))
+                    except:
+                        continue
+
+                if dose_spans:
+                    # sort by dose value descending to pick highest dose first
+                    dose_spans.sort(key=lambda x: x[0], reverse=True)
+
+                    found_for_highest = None
+                    for dose_val, ds, de in dose_spans:
+                        # search forward up to 120 chars for a range or percent
+                        look = sentence[de:de+120]
+                        # prefer a range first
+                        m_range = range_re.search(look)
+                        if m_range:
+                            a = parse_number(m_range.group(1)); b = parse_number(m_range.group(2))
+                            if not (math.isnan(a) or math.isnan(b)):
+                                found_for_highest = max(a, b)
+                                break
+                        # otherwise pick first percent
+                        m_pct = re_pct.search(look)
+                        if m_pct:
+                            v = parse_number(m_pct.group(1))
+                            if not math.isnan(v):
+                                found_for_highest = v
+                                break
+                    if found_for_highest is not None:
+                        # force this into extracted and set as selected (unless computed_reductions override above)
+                        sel_pct = fmt_pct(found_for_highest)
+                        if sel_pct not in extracted:
+                            extracted.insert(0, sel_pct)
+                        selected = sel_pct
+            # --- end dose-aware extraction ---
 
             # convert negative selected to positive absolute (as requested by rules)
             if selected:
