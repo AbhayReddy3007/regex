@@ -1,10 +1,16 @@
-# streamlit_hba1c_weight_llm_with_kg_fromto.py
-# Full app with updated behavior:
-# - For HbA1c "from X% to Y%" -> relative reduction ((X-Y)/X)*100 (existing behavior)
-# - NEW: For weight "from x kg to y kg" -> relative reduction ((x - y) / y) * 100 (user-specified)
-# - Baseline % (sidebar) is used only when no "from x kg to y kg" case exists.
-# - Regex now recognizes kg-from->to and includes computed relative weight reduction in allowed set.
-# - LLM is instructed to compute reductions, but the code will validate and force correct values.
+# streamlit_hba1c_weight_llm_with_kg_fromto_fixed.py
+# Full app with:
+# - Strict LLM rules to avoid irrelevant extractions.
+# - HbA1c: "from X% to Y%" -> relative reduction ((X-Y)/X)*100 (unchanged).
+# - Weight: "from x kg to y kg" -> relative reduction ((x - y) / x) * 100  (UPDATED to your request).
+# - If sentence contains an explicit weight %, prefer that percent.
+# - If no percent in sentence and kg from->to exists, use the kg-from->to computed percent.
+# - If no percent and no kg-from->to but kg values exist and baseline provided, compute percent = (kg_loss / baseline)*100.
+# - New column "weight KG" contains detected kg losses.
+#
+# Usage:
+#  - Set API_KEY (optional) to enable Gemini LLM.
+#  - Save and run: `streamlit run streamlit_hba1c_weight_llm_with_kg_fromto_fixed.py`
 
 import re
 import math
@@ -27,7 +33,7 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
-st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor (with kg from->to)", layout="wide")
+st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor (with kg from->to fixed)", layout="wide")
 st.title("HbA1c / A1c + Body Weight — regex + Gemini 2.0 Flash (reads the sentence column)")
 
 # -------------------- Sidebar options --------------------
@@ -53,7 +59,7 @@ DASH = r'(?:-|–|—)'
 
 # percent from->to (for percents)
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
-# kg from->to (new)
+# kg from->to (NEW)
 FROM_TO_KG = rf'from\s+({NUM})\s*(?:kg|kgs|kilogram|kilograms)\s*(?:to|->|{DASH})\s*({NUM})\s*(?:kg|kgs|kilogram|kilograms)?'
 REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
 ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
@@ -169,15 +175,15 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 reduction_val = None
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_val)
 
-    # 1b) kg from->to (NEW: compute relative per user formula ((x - y)/y)*100)
+    # 1b) kg from->to — compute relative reduction using ((x - y) / x) * 100 (UPDATED)
     for m in re_fromto_kg.finditer(sent):
         a = parse_number(m.group(1))  # original x (kg)
         b = parse_number(m.group(2))  # new y (kg)
         reduction_val = None
-        if (not math.isnan(a)) and (not math.isnan(b)) and (b != 0):
+        if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
             try:
-                # user-specified formula: ((x - y) / y) * 100
-                reduction_val = ((a - b) / b) * 100.0
+                # standard relative reduction: ((x - y) / x) * 100
+                reduction_val = ((a - b) / a) * 100.0
             except:
                 reduction_val = None
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_kg', [a, b], reduction_val)
@@ -308,10 +314,12 @@ Return STRICT JSON only, with EXACT keys:
 VERY IMPORTANT — Be conservative:
 - Extract ONLY percentages that clearly refer to the TARGET and describe a CHANGE.
 - DO NOT extract unrelated percentages (population %, p-values not representing change, baseline-only percentages).
+- If a percentage is ambiguous in context, DO NOT extract it.
 - When seeing "from X% to Y%" for HbA1c/A1c, COMPUTE THE RELATIVE REDUCTION:
       ((X - Y) / X) * 100
-- NEW: When seeing "from x kg to y kg" for Body weight, COMPUTE THE RELATIVE REDUCTION using the user-specified formula:
-      ((x - y) / y) * 100
+  Format it with a '%' sign (3 decimals fine), include it in "extracted" and set as "selected_percent".
+- For Body weight: when seeing "from x kg to y kg", COMPUTE THE RELATIVE REDUCTION using:
+      ((x - y) / x) * 100
   Format with a '%' sign (3 decimals fine), include it in "extracted" and set as "selected_percent".
 - For ranges like "1.2–1.5%", include both endpoints in "extracted" and prefer the HIGHER endpoint for "selected_percent".
 - If multiple doses are present, prefer the change associated with the HIGHEST dose when choosing "selected_percent".
@@ -328,8 +336,8 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
       - kg_fromto_computed_list (list of percent strings computed from 'from x kg to y kg' found by regex)
     Behavior:
       - If 'from X% to Y%' (HbA1c) exists -> compute ((X-Y)/X)*100 and force it.
-      - If 'from x kg to y kg' exists -> compute ((x - y) / y)*100 and force it for Body weight.
-      - Baseline-based percent (sidebar) will be used **only** when no kg-from->to computed reduction exists.
+      - If 'from x kg to y kg' exists -> compute ((x - y) / x)*100 and force it for Body weight.
+      - Baseline-based percent (sidebar) is used only when no kg-from->to computed reduction exists and no percent exists in sentence.
     """
     # If model unavailable: still parse kg in sentence for fallback
     if model is None or not sentence.strip():
@@ -339,12 +347,12 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
             num = parse_number(m.group(1))
             if not math.isnan(num):
                 kg_list.append(num)
-        # computed kg-from->to via regex
+        # computed kg-from->to via regex (updated formula)
         for m in re_fromto_kg.finditer(sentence):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
-            if not (math.isnan(a) or math.isnan(b)) and b != 0:
+            if not (math.isnan(a) or math.isnan(b)) and a != 0:
                 try:
-                    rel = ((a - b) / b) * 100.0
+                    rel = ((a - b) / a) * 100.0
                     kg_fromto_list.append(fmt_pct(rel))
                 except:
                     pass
@@ -365,12 +373,12 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 except:
                     pass
 
-    # Weight kg from->to (NEW per user formula ((x - y)/y)*100)
+    # Weight kg from->to (UPDATED per user formula ((x - y)/x)*100)
     for m_kg in re_fromto_kg.finditer(sentence):
         a = parse_number(m_kg.group(1)); b = parse_number(m_kg.group(2))
-        if not (math.isnan(a) or math.isnan(b)) and b != 0:
+        if not (math.isnan(a) or math.isnan(b)) and a != 0:
             try:
-                rel_w = ((a - b) / b) * 100.0
+                rel_w = ((a - b) / a) * 100.0
                 computed_weight_fromto_reductions.append(fmt_pct(rel_w))
             except:
                 pass
@@ -423,7 +431,7 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', xn):
             extracted.append(xn)
 
-    # harvest kg from sentence as backup
+    # also harvest kg from sentence as backup
     if not kg_list:
         for m in re_kg.finditer(sentence):
             num = parse_number(m.group(1))
@@ -442,15 +450,12 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         return extracted, selected, kg_list, []
 
     # Weight kg-from->to computed reductions (force for Body weight target)
-    if computed_weight_fromto_reductions and target_label.lower().startswith('body weight'.split()[0]) or (target_label.lower().startswith('body weight') or target_label.lower().startswith('weight')):
-        # above condition ensures we handle weight-like labels; simplify check:
-        if computed_weight_fromto_reductions:
-            compw = computed_weight_fromto_reductions[0]
-            if compw not in extracted:
-                extracted.insert(0, compw)
-            selected = compw
-            # return and include the computed list so process_df knows not to use baseline
-            return [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)], selected, kg_list, computed_weight_fromto_reductions
+    if computed_weight_fromto_reductions and (target_label.lower().startswith('body weight') or target_label.lower().startswith('weight')):
+        compw = computed_weight_fromto_reductions[0]
+        if compw not in extracted:
+            extracted.insert(0, compw)
+        selected = compw
+        return [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)], selected, kg_list, computed_weight_fromto_reductions
 
     # 4) No forced computed reductions: validate LLM percents against regex allowed set
     allowed_set = _allowed_percents_from_regex(sentence, target_label)
@@ -635,16 +640,16 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
         else:
-            # even without model, detect kg in sentence and kg-from->to computed reductions
+            # even without model, detect kg in sentence and kg-from->to computed reductions (using updated formula)
             for mkg in re_kg.finditer(weight_sentence_str):
                 num = parse_number(mkg.group(1))
                 if not math.isnan(num):
                     wt_kg_list.append(num)
             for m in re_fromto_kg.finditer(weight_sentence_str):
                 a = parse_number(m.group(1)); b = parse_number(m.group(2))
-                if not (math.isnan(a) or math.isnan(b)) and b != 0:
+                if not (math.isnan(a) or math.isnan(b)) and a != 0:
                     try:
-                        rel = ((a - b) / b) * 100.0
+                        rel = ((a - b) / a) * 100.0
                         wt_kg_fromto_computed.append(fmt_pct(rel))
                     except:
                         pass
@@ -664,27 +669,52 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             except:
                 pass
 
-        # DECISION LOGIC:
-        # 1) If we have computed wt_kg_fromto_computed (from "from x kg to y kg"), use that as selected and do NOT use baseline.
-        # 2) Else if kg_list present and baseline provided -> compute % = (kg_loss / baseline) * 100 and use that.
-        # 3) Else keep wt_selected as returned/validated by LLM (or empty).
+        # ---------------- DECISION LOGIC (per user request) ----------------
+        # Priority:
+        # 1) If sentence contains any explicit percent tokens for weight -> use percent (prefer LLM selected if present; else use regex max).
+        # 2) Else (no percent in sentence):
+        #    a) If kg-from->to computed exists -> use that computed percent (forced).
+        #    b) Else if kg_list exists and baseline provided -> compute percent from baseline and use that.
+        #    c) Else leave wt_selected as-is.
 
-        # 1) weight from->to computed (priority)
-        if wt_kg_fromto_computed:
-            # prefer first computed (matches earlier behavior)
-            chosen = wt_kg_fromto_computed[0]
-            if chosen not in wt_llm_extracted:
-                wt_llm_extracted.insert(0, chosen)
-            wt_selected = chosen
+        sentence_has_pct = bool(re_pct.search(weight_sentence_str))
+
+        if sentence_has_pct:
+            # Prefer any LLM-selected percent (it should have been validated earlier)
+            if wt_selected:
+                pass  # keep it
+            else:
+                # pick numeric max percent found in the sentence by regex
+                pct_vals = []
+                for m in re_pct.finditer(weight_sentence_str):
+                    v = parse_number(m.group(1))
+                    if not math.isnan(v):
+                        pct_vals.append(v)
+                if pct_vals:
+                    max_pct = max(pct_vals)
+                    wt_selected = fmt_pct(max_pct)
+                    if wt_selected not in wt_llm_extracted:
+                        wt_llm_extracted.insert(0, wt_selected)
+            # Do NOT use kg-from->to or baseline in this branch
         else:
-            # 2) baseline-based percent only if no from->to present
-            if wt_kg_list and baseline_kg and baseline_kg > 0:
-                max_kg = max(wt_kg_list)
-                pct_from_baseline = (max_kg / float(baseline_kg)) * 100.0
-                wt_selected = fmt_pct(pct_from_baseline)
-                if wt_selected not in wt_llm_extracted:
-                    wt_llm_extracted.insert(0, wt_selected)
-            # otherwise keep whatever wt_selected the LLM provided (possibly empty)
+            # no percent token in sentence -> try kg-from->to first (if present), else baseline-based kg -> percent
+            if wt_kg_fromto_computed:
+                # use the first computed kg-from->to percent
+                chosen = wt_kg_fromto_computed[0]
+                if chosen not in wt_llm_extracted:
+                    wt_llm_extracted.insert(0, chosen)
+                wt_selected = chosen
+            else:
+                # no kg-from->to computed reductions -> fallback to baseline if kg values exist
+                if wt_kg_list and baseline_kg and baseline_kg > 0:
+                    max_kg = max(wt_kg_list)
+                    pct_from_baseline = (max_kg / float(baseline_kg)) * 100.0
+                    wt_selected = fmt_pct(pct_from_baseline)
+                    if wt_selected not in wt_llm_extracted:
+                        wt_llm_extracted.insert(0, wt_selected)
+                else:
+                    # nothing to override; keep whatever wt_selected currently is (likely empty)
+                    pass
 
         # Ensure selected% formatted & positive
         def normalize_selected(s):
@@ -816,6 +846,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_with_llm_and_weightkg_fromto.xlsx',
+    file_name='results_with_llm_and_weightkg_fromto_fixed.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
