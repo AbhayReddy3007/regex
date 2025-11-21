@@ -1,10 +1,5 @@
-# streamlit_hba1c_weight_strict_debug_fallback_llm_fixed_full.py
-# Full Streamlit app — copy-paste ready with fixes:
-# - robust _norm_percent
-# - improved configure_gemini + call_model_deterministic with better error messages
-# - quick LLM test UI
-# - behavior otherwise follows your previous strict+debug+fallback design
-
+# streamlit_hba1c_weight_strict_debug_fallback_llm_full_restore.py
+# Full Streamlit app — copy-paste ready. Restores robust extraction for both HbA1c and Weight.
 import re
 import math
 import json
@@ -23,7 +18,7 @@ GENAI_AVAILABLE = False
 genai = None  # will be assigned if import succeeds
 
 st.set_page_config(page_title="HbA1c & Weight % Extractor (strict + debug + fallback LLM)", layout="wide")
-st.title("HbA1c / A1c + Body Weight — strict + deterministic LLM extraction with debug & fallback")
+st.title("HbA1c / A1c + Body Weight — strict + deterministic LLM extraction with debug & fallback (restored)")
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Options")
@@ -49,7 +44,8 @@ DASH = r'(?:-|–|—)'
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
 FROM_TO_KG = rf'from\s+({NUM})\s*(?:kg|kgs|kilogram|kilograms)\s*(?:to|->|{DASH})\s*({NUM})\s*(?:kg|kgs|kilogram|kilograms)?'
 REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
-ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
+# absolute percent or "percentage points" or "pp"
+ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of|percentage\s+points|percentage-point|pp\b)\s*({NUM})(?:\s*(?:percentage\s*points|pp)?)?'
 RANGE_PCT = rf'({NUM})\s*{DASH}\s*({NUM})\s*%'
 
 FLAGS = re.IGNORECASE
@@ -97,12 +93,11 @@ def _norm_percent(v: str) -> str:
     Normalize a percent-like token into a canonical 'N%' string.
     Accepts numbers like '1.2', '1,2%', '1.2%' and returns '1.2%'.
     Leaves empty/invalid inputs as ''.
-    This version is defensive: accepts floats/ints also, strips spaces and percent signs,
-    accepts leading +/-, and returns absolute value formatted with fmt_pct.
+    Accepts 'pp' or 'percentage points' and treats them as percent tokens.
     """
     if v is None:
         return ""
-    # if it's already numeric
+    # numeric input
     if isinstance(v, (int, float)):
         try:
             return fmt_pct(abs(float(v)))
@@ -111,8 +106,9 @@ def _norm_percent(v: str) -> str:
     s = str(v).strip()
     if s == "":
         return ""
-    # remove percent sign, spaces, thousands separators
     s = s.replace('%', '').replace(',', '.').replace('·', '.').replace(' ', '')
+    # remove trailing 'pp' if present
+    s = re.sub(r'(?i)pp$', '', s)
     # allow leading plus/minus, digits and optional decimal
     if not re.match(r'^[+-]?\d+(?:\.\d+)?$', s):
         return ""
@@ -274,18 +270,37 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     return filtered, sentences_used
 
 def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
+    """
+    Relaxes HbA1c acceptance while keeping weight conservative:
+    - HbA1c: require HbA1c term AND (reduction cue OR any pct/from->to/abs-pp/range)
+    - Weight: require term AND reduction cue AND pct/kg/from->to (original strict)
+    """
     if not isinstance(sent, str):
         return False
+
     has_term = bool(term_re.search(sent))
     has_cue  = bool(re_reduction_cue.search(sent))
-    has_pct_or_kg = bool(re_pct.search(sent)) or bool(re_kg.search(sent)) or bool(re_fromto_kg.search(sent))
-    return has_term and has_cue and has_pct_or_kg
+    has_pct_or_kg = bool(re_pct.search(sent)) or bool(re_kg.search(sent)) or bool(re_fromto_kg.search(sent)) or bool(re_fromto.search(sent))
+    has_abs_pp = bool(re_abs_pp.search(sent))
+    has_range = bool(re_range.search(sent))
+
+    # detect if this is HbA1c term (by pattern equality) - safer fallback: check sentence tokens
+    try:
+        is_hba = (term_re.pattern == re_hba1c.pattern)
+    except Exception:
+        is_hba = bool(re_hba1c.search(sent))
+
+    if is_hba:
+        return has_term and (has_cue or has_pct_or_kg or has_abs_pp or has_range)
+
+    # weight (original strict rule)
+    return has_term and has_cue and (has_pct_or_kg or has_abs_pp or has_range)
 
 # -------------------- Robust Gemini configuration & deterministic call wrapper ----------
 def configure_gemini(api_key: str) -> Tuple[Optional[object], str]:
     """
     Try to configure google.generativeai and return (model_handle_or_module_or_None, error_string).
-    This version records full exceptions to help debug SDK mismatch/API key issues.
+    This version returns helpful exception strings to debug SDK/API issues.
     """
     global genai, GENAI_AVAILABLE
     if not api_key:
@@ -296,7 +311,6 @@ def configure_gemini(api_key: str) -> Tuple[Optional[object], str]:
         GENAI_AVAILABLE = True
     except Exception as e:
         return None, f"Failed to import google.generativeai: {repr(e)}"
-    # configure (may raise)
     try:
         genai.configure(api_key=api_key)
     except Exception as e:
@@ -312,7 +326,6 @@ def configure_gemini(api_key: str) -> Tuple[Optional[object], str]:
                 return genai, configure_err
         except Exception as e2:
             return genai, configure_err + f" ; fallback error: {repr(e2)}"
-    # if configure succeeded, try to return a model object if possible
     try:
         model_obj = genai.GenerativeModel("gemini-2.0-flash")
         return model_obj, ""
@@ -326,10 +339,9 @@ if configure_error:
 
 def call_model_deterministic(model_handle, prompt: str, timeout: int = 20) -> Tuple[str, str]:
     """
-    Try multiple supported SDK call styles deterministically. Returns (text, error_str).
+    Try several SDK call styles deterministically. Return (text, error_str).
     """
     last_err = None
-    # try model object style (newer SDKs)
     try:
         if model_handle is not None and hasattr(model_handle, "generate_content"):
             resp = model_handle.generate_content(prompt, temperature=0.0)
@@ -339,7 +351,6 @@ def call_model_deterministic(model_handle, prompt: str, timeout: int = 20) -> Tu
     except Exception as e:
         last_err = f"model_handle.generate_content failed: {repr(e)}"
 
-    # try module-level helpers
     if 'genai' in globals() and genai is not None:
         try:
             if hasattr(genai, "generate_text"):
@@ -451,7 +462,30 @@ def llm_extract_from_sentence(model_handle, target_label: str, sentence: str, dr
             except:
                 pass
 
+    # Build allowed candidates from regex/computed values
     allowed_via_regex = sorted(list(_allowed_percents_from_regex(sentence, target_label)))
+
+    # If authoritative empty, include raw percent tokens (safely) so LLM has candidates
+    if not allowed_via_regex:
+        # harvest percent tokens in sentence
+        raw_pcts = []
+        for m in re_pct.finditer(sentence):
+            v = parse_number(m.group(1))
+            if not math.isnan(v):
+                raw_pcts.append(fmt_pct(v))
+        # include absolute pp tokens too
+        for m in re_abs_pp.finditer(sentence):
+            v = parse_number(m.group(1))
+            if not math.isnan(v):
+                raw_pcts.append(fmt_pct(v))
+        # include computed from->to
+        raw_all = computed + raw_pcts
+        # dedupe preserving order
+        seen = set(); raw_f = []
+        for x in raw_all:
+            if x not in seen:
+                seen.add(x); raw_f.append(x)
+        allowed_via_regex = raw_f
 
     # contextual filter for weight target to avoid A1c bleed
     if target_label.lower().startswith('body weight') or target_label.lower().startswith('weight'):
@@ -634,6 +668,24 @@ def _allowed_percents_from_regex(sentence: str, target_label: str) -> set:
                             allowed.add(fmt_pct(num))
                     except:
                         pass
+
+    # also include percent tokens even if not captured by extract_sentences if sentence contains direct pct tokens
+    for m in re_pct.finditer(sentence):
+        try:
+            v = parse_number(m.group(1))
+            if not math.isnan(v):
+                allowed.add(fmt_pct(v))
+        except:
+            pass
+    # include absolute pp tokens too
+    for m in re_abs_pp.finditer(sentence):
+        try:
+            v = parse_number(m.group(1))
+            if not math.isnan(v):
+                allowed.add(fmt_pct(v))
+        except:
+            pass
+
     return allowed
 
 # -------------------- Scoring helpers --------------------
@@ -789,6 +841,11 @@ def process_df(_model_handle, df_in: pd.DataFrame, text_col: str, drug_col_name:
             else:
                 pct_vals = []
                 for m in re_pct.finditer(weight_sentence_str):
+                    v = parse_number(m.group(1))
+                    if not math.isnan(v):
+                        pct_vals.append(v)
+                # also include ABS_PP tokens as percents if present
+                for m in re_abs_pp.finditer(weight_sentence_str):
                     v = parse_number(m.group(1))
                     if not math.isnan(v):
                         pct_vals.append(v)
@@ -983,6 +1040,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_strict_debug_fallback_llm_fixed.xlsx',
+    file_name='results_strict_debug_fallback_llm_full_restore.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
