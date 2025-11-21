@@ -1,18 +1,9 @@
-# streamlit_hba1c_weight_strict_debug_fallback_llm.py
-# Full Streamlit app — copy-paste ready.
-# Features:
-# - Strict, deterministic LLM rules and grounding (ALLOWED_PERCENTS).
-# - Robust Gemini configuration and deterministic call wrapper with detailed debug output.
-# - Automatic fallback: when the LLM fails or returns nothing, the app uses regex/computed-only logic.
-# - Prevents A1c values leaking into weight extraction (contextual filtering).
-# - Honors "mean decrease" / "mean reduction" proximity: prefers value nearest that phrase.
-# - LLM returns a preference ("percent" or "kg") to indicate which measure to use; code validates & falls back deterministically.
-# - HbA1c: "from X% to Y%" -> relative reduction ((X - Y)/X)*100.
-# - Weight: "from x kg to y kg" -> relative reduction ((x - y)/x)*100.
-#
-# Usage:
-# - Set API_KEY to enable Gemini LLM (optional).
-# - Run with: streamlit run streamlit_hba1c_weight_strict_debug_fallback_llm.py
+# streamlit_hba1c_weight_strict_debug_fallback_llm_fixed_full.py
+# Full Streamlit app — copy-paste ready with fixes:
+# - robust _norm_percent
+# - improved configure_gemini + call_model_deterministic with better error messages
+# - quick LLM test UI
+# - behavior otherwise follows your previous strict+debug+fallback design
 
 import re
 import math
@@ -100,6 +91,36 @@ def fmt_pct(v):
         return ''
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
+
+def _norm_percent(v: str) -> str:
+    """
+    Normalize a percent-like token into a canonical 'N%' string.
+    Accepts numbers like '1.2', '1,2%', '1.2%' and returns '1.2%'.
+    Leaves empty/invalid inputs as ''.
+    This version is defensive: accepts floats/ints also, strips spaces and percent signs,
+    accepts leading +/-, and returns absolute value formatted with fmt_pct.
+    """
+    if v is None:
+        return ""
+    # if it's already numeric
+    if isinstance(v, (int, float)):
+        try:
+            return fmt_pct(abs(float(v)))
+        except:
+            return ""
+    s = str(v).strip()
+    if s == "":
+        return ""
+    # remove percent sign, spaces, thousands separators
+    s = s.replace('%', '').replace(',', '.').replace('·', '.').replace(' ', '')
+    # allow leading plus/minus, digits and optional decimal
+    if not re.match(r'^[+-]?\d+(?:\.\d+)?$', s):
+        return ""
+    try:
+        num = float(s)
+    except:
+        return ""
+    return fmt_pct(abs(num))
 
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
@@ -264,28 +285,39 @@ def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
 def configure_gemini(api_key: str) -> Tuple[Optional[object], str]:
     """
     Try to configure google.generativeai and return (model_handle_or_module_or_None, error_string).
+    This version records full exceptions to help debug SDK mismatch/API key issues.
     """
     global genai, GENAI_AVAILABLE
     if not api_key:
         return None, "API_KEY empty"
     try:
-        import google.generativeai as _genai  # may raise
+        import google.generativeai as _genai
         genai = _genai
         GENAI_AVAILABLE = True
     except Exception as e:
-        return None, f"Failed to import google.generativeai: {e}"
+        return None, f"Failed to import google.generativeai: {repr(e)}"
+    # configure (may raise)
     try:
         genai.configure(api_key=api_key)
     except Exception as e:
-        # continue: still might be able to call genai.generate style
-        return genai, f"Warning during configure: {e}"
-    # Prefer returning a model object if SDK supports it
+        configure_err = f"Warning during genai.configure: {repr(e)}"
+        try:
+            model_obj = getattr(genai, "GenerativeModel", None)
+            if model_obj:
+                try:
+                    return genai.GenerativeModel("gemini-2.0-flash"), configure_err
+                except Exception as e2:
+                    return genai, configure_err + f" ; Failed to init GenerativeModel: {repr(e2)}"
+            else:
+                return genai, configure_err
+        except Exception as e2:
+            return genai, configure_err + f" ; fallback error: {repr(e2)}"
+    # if configure succeeded, try to return a model object if possible
     try:
         model_obj = genai.GenerativeModel("gemini-2.0-flash")
         return model_obj, ""
-    except Exception:
-        # fallback to returning genai module for direct calls
-        return genai, ""
+    except Exception as e:
+        return genai, f"Configured but GenerativeModel() failed: {repr(e)}"
 
 # call once
 _model_handle, configure_error = configure_gemini(API_KEY if use_llm else "")
@@ -294,19 +326,20 @@ if configure_error:
 
 def call_model_deterministic(model_handle, prompt: str, timeout: int = 20) -> Tuple[str, str]:
     """
-    Try several SDK call styles (deterministic). Return (text, error_str).
+    Try multiple supported SDK call styles deterministically. Returns (text, error_str).
     """
-    # 1) Preferred: model_handle.generate_content(prompt, temperature=0.0)
+    last_err = None
+    # try model object style (newer SDKs)
     try:
-        if hasattr(model_handle, "generate_content"):
+        if model_handle is not None and hasattr(model_handle, "generate_content"):
             resp = model_handle.generate_content(prompt, temperature=0.0)
-            text = (getattr(resp, "text", "") or "").strip()
+            text = getattr(resp, "text", None) or getattr(resp, "content", None) or ""
             if text:
-                return text, ""
-    except Exception:
-        pass
+                return text.strip(), ""
+    except Exception as e:
+        last_err = f"model_handle.generate_content failed: {repr(e)}"
 
-    # 2) Try genai.generate_text or genai.generate or genai.models.generate
+    # try module-level helpers
     if 'genai' in globals() and genai is not None:
         try:
             if hasattr(genai, "generate_text"):
@@ -318,30 +351,25 @@ def call_model_deterministic(model_handle, prompt: str, timeout: int = 20) -> Tu
                 else:
                     text = str(resp)
                 if text:
-                    return text, ""
-            if hasattr(genai, "generate"):
-                resp = genai.generate(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
-                if hasattr(resp, "text"):
-                    text = getattr(resp, "text") or ""
-                elif isinstance(resp, dict):
-                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "")
-                else:
-                    text = str(resp)
-                if text:
-                    return text, ""
+                    return text.strip(), ""
             if hasattr(genai, "models") and hasattr(genai.models, "generate"):
                 resp = genai.models.generate(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
-                if hasattr(resp, "text"):
-                    text = getattr(resp, "text") or ""
-                elif isinstance(resp, dict):
-                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "")
+                if isinstance(resp, dict):
+                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "") or resp.get("text", "")
                 else:
-                    text = str(resp)
+                    text = getattr(resp, "text", None) or str(resp)
                 if text:
-                    return text, ""
+                    return text.strip(), ""
+            if hasattr(genai, "generate"):
+                resp = genai.generate(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
+                text = getattr(resp, "text", None) or (resp.get("candidates", [{}])[0].get("content", "") if isinstance(resp, dict) else None) or str(resp)
+                if text:
+                    return text.strip(), ""
         except Exception as e:
-            return "", f"genai call error: {e}"
+            return "", f"genai call error: {repr(e)}"
 
+    if last_err:
+        return "", last_err
     return "", "No supported model call succeeded; check SDK version / API key / network."
 
 # -------------------- Strict LLM RULES (detailed) --------------------
@@ -892,6 +920,17 @@ if drug_col and drug_col not in df.columns:
 
 st.success(f'Loaded {len(df)} rows. Processing...')
 
+# -------------------- Quick LLM test UI --------------------
+if configure_error:
+    st.sidebar.error(f"Gemini configure: {configure_error}")
+
+if st.sidebar.button("Run quick LLM test on sample sentence"):
+    sample = "Sample sentence: HbA1c decreased by 1.2%."
+    t, err = call_model_deterministic(_model_handle, "Return exactly a short JSON confirming you saw: " + sample)
+    st.sidebar.text_area("Model raw output", value=t or "(empty)", height=160)
+    if err:
+        st.sidebar.warning("Model error: " + str(err))
+
 # -------------------- Run processing --------------------
 out_df = process_df(_model_handle if use_llm else None, df, col_name, drug_col, baseline_weight_kg)
 
@@ -944,6 +983,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_strict_debug_fallback_llm.xlsx',
+    file_name='results_strict_debug_fallback_llm_fixed.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
