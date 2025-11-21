@@ -1,23 +1,24 @@
-# streamlit_hba1c_weight_strict_pref_llm.py
+# streamlit_hba1c_weight_strict_debug_llm.py
 # Full Streamlit app — copy-paste ready.
 # Features:
 # - Strict, deterministic LLM rules and grounding (ALLOWED_PERCENTS).
+# - Robust Gemini configuration and deterministic call wrapper with detailed debug output.
 # - Prevents A1c values leaking into weight extraction (contextual filtering).
 # - Honors "mean decrease" / "mean reduction" proximity: prefers value nearest that phrase.
 # - LLM returns a preference ("percent" or "kg") to indicate which measure to use; code validates & falls back deterministically.
 # - HbA1c: "from X% to Y%" -> relative reduction ((X - Y)/X)*100.
 # - Weight: "from x kg to y kg" -> relative reduction ((x - y)/x)*100.
-# - If sentence contains explicit percent for weight -> prefer that; else kg-from->to -> baseline-derived.
+# - If model fails or returns nothing, app falls back to regex-only computed values and shows debug details.
 #
 # Usage:
 # - Set API_KEY to enable Gemini LLM (optional).
-# - Run with: streamlit run streamlit_hba1c_weight_strict_pref_llm.py
+# - Run with: streamlit run streamlit_hba1c_weight_strict_debug_llm.py
 
 import re
 import math
 import json
 from io import BytesIO
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -26,16 +27,12 @@ import streamlit as st
 API_KEY = ""   # <- replace with your real key if you want LLM enabled
 # =========================================================================
 
-# Lazy Gemini import so the app still runs without the package
+# Lazy Gemini import flag; we'll try to import inside configure_gemini
 GENAI_AVAILABLE = False
-try:
-    import google.generativeai as genai
-    GENAI_AVAILABLE = True
-except Exception:
-    GENAI_AVAILABLE = False
+genai = None  # will be assigned if import succeeds
 
-st.set_page_config(page_title="HbA1c & Weight % Extractor (strict + preference)", layout="wide")
-st.title("HbA1c / A1c + Body Weight — strict + preference LLM extraction")
+st.set_page_config(page_title="HbA1c & Weight % Extractor (strict + debug LLM)", layout="wide")
+st.title("HbA1c / A1c + Body Weight — strict + deterministic LLM extraction with debug")
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Options")
@@ -43,7 +40,7 @@ uploaded = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx',
 col_name = st.sidebar.text_input('Column with abstracts/text', value='abstract')
 drug_col = st.sidebar.text_input('Column with drug name (optional)', value='drug_name')
 sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
-show_debug = st.sidebar.checkbox('Show debug columns (raw LLM output, rejected values)', value=False)
+show_debug = st.sidebar.checkbox('Show debug columns (raw LLM output, rejected values)', value=True)
 use_llm = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash)', value=True)
 baseline_weight_kg = st.sidebar.number_input(
     'Baseline weight for percent calc (kg)', value=70.0, min_value=1.0, step=0.1, format="%.1f"
@@ -174,7 +171,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
         reduction_val = None
         if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
             try:
-                reduction_val = ((a - b) / a) * 100.0  # standard relative reduction per user request
+                reduction_val = ((a - b) / a) * 100.0  # user-requested formula
             except:
                 reduction_val = None
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_kg', [a, b], reduction_val)
@@ -213,6 +210,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 v = parse_number(last_pct.group(1))
                 add_match(matches, si, abs_start, last_pct, f'{tag_prefix}:percent_prev60chars', [v], v)
 
+    # dedupe & sort
     seen = set()
     uniq = []
     for mm in matches:
@@ -262,77 +260,137 @@ def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
     has_pct_or_kg = bool(re_pct.search(sent)) or bool(re_kg.search(sent)) or bool(re_fromto_kg.search(sent))
     return has_term and has_cue and has_pct_or_kg
 
-# -------------------- Gemini setup --------------------
-def configure_gemini(api_key: str):
-    if not GENAI_AVAILABLE or not api_key:
-        return None
+# -------------------- Robust Gemini configuration & deterministic call wrapper ----------
+def configure_gemini(api_key: str) -> Tuple[Optional[object], str]:
+    """
+    Try to configure google.generativeai and return (model_handle_or_module_or_None, error_string).
+    """
+    global genai, GENAI_AVAILABLE
+    if not api_key:
+        return None, "API_KEY empty"
+    try:
+        import google.generativeai as _genai  # may raise
+        genai = _genai
+        GENAI_AVAILABLE = True
+    except Exception as e:
+        return None, f"Failed to import google.generativeai: {e}"
     try:
         genai.configure(api_key=api_key)
-        return genai.GenerativeModel("gemini-2.0-flash")
+    except Exception as e:
+        # continue: still might be able to call genai.generate style
+        return genai, f"Warning during configure: {e}"
+    # Prefer returning a model object if SDK supports it
+    try:
+        model_obj = genai.GenerativeModel("gemini-2.0-flash")
+        return model_obj, ""
     except Exception:
-        return None
+        # fallback to returning genai module for direct calls
+        return genai, ""
 
-model = configure_gemini(API_KEY) if use_llm else None
+# call once
+_model_handle, configure_error = configure_gemini(API_KEY if use_llm else "")
+if configure_error:
+    st.sidebar.warning(f"Gemini configure note: {configure_error}")
 
-def _norm_percent(v: str) -> str:
-    v = (v or "").strip().replace(" ", "")
-    if v and not v.endswith("%"):
-        if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
-            v += "%"
-    return v
+def call_model_deterministic(model_handle, prompt: str, timeout: int = 20) -> Tuple[str, str]:
+    """
+    Try several SDK call styles (deterministic). Return (text, error_str).
+    """
+    # 1) Preferred: model_handle.generate_content(prompt, temperature=0.0)
+    try:
+        if hasattr(model_handle, "generate_content"):
+            resp = model_handle.generate_content(prompt, temperature=0.0)
+            text = (getattr(resp, "text", "") or "").strip()
+            if text:
+                return text, ""
+    except Exception as e:
+        # capture and continue to try other methods
+        pass
 
-# -------------------- DETAILED LLM RULES --------------------
+    # 2) Try genai.generate_text or genai.generate or genai.models.generate
+    if 'genai' in globals() and genai is not None:
+        try:
+            if hasattr(genai, "generate_text"):
+                resp = genai.generate_text(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
+                # resp may be object with text or dict-like
+                if hasattr(resp, "text"):
+                    text = getattr(resp, "text") or ""
+                elif isinstance(resp, dict):
+                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "")
+                else:
+                    text = str(resp)
+                if text:
+                    return text, ""
+            if hasattr(genai, "generate"):
+                resp = genai.generate(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
+                if hasattr(resp, "text"):
+                    text = getattr(resp, "text") or ""
+                elif isinstance(resp, dict):
+                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "")
+                else:
+                    text = str(resp)
+                if text:
+                    return text, ""
+            if hasattr(genai, "models") and hasattr(genai.models, "generate"):
+                resp = genai.models.generate(model="gemini-2.0-flash", prompt=prompt, temperature=0.0)
+                if hasattr(resp, "text"):
+                    text = getattr(resp, "text") or ""
+                elif isinstance(resp, dict):
+                    text = resp.get("candidates", [{}])[0].get("content", "") or resp.get("output", "")
+                else:
+                    text = str(resp)
+                if text:
+                    return text, ""
+        except Exception as e:
+            return "", f"genai call error: {e}"
+
+    return "", "No supported model call succeeded; check SDK version / API key / network."
+
+# -------------------- Strict LLM RULES (detailed) --------------------
 LLM_RULES = """
 You are a strict, conservative information-extraction assistant. Read the provided SENTENCE(S) and EXTRACT ONLY percentage CHANGES that refer to the TARGET (one of: "HbA1c", "A1c", "Body weight").
 
 OUTPUT (MANDATORY, JSON ONLY)
-Return EXACTLY a single JSON object and nothing else, with these keys:
+Return EXACTLY a single JSON object and nothing else, with keys:
 {
   "extracted": ["...%", "...%"],    // percent strings present in sentence or computed from from->to
   "selected_percent": "...%",        // single percent string chosen as the best candidate (or "" if none)
-  "preference": "percent" | "kg"     // OPTIONAL — state which measure you prefer (percent or kg-derived). If omitted, code will fallback deterministically.
+  "preference": "percent" | "kg"     // OPTIONAL — state which measure you prefer (percent or kg-derived).
 }
 
-VERY IMPORTANT RULES
-1) ONLY include percentages that:
-   - are exact percent tokens present in the SENTENCE AND clearly tied to TARGET, OR
-   - are computed from an explicit "from X% to Y%" or "from x kg to y kg" present in the SENTENCE.
-   If neither, DO NOT include.
+VERY IMPORTANT RULES (do not break)
+- ONLY include percentages that:
+  * are exact percent tokens present in the SENTENCE AND clearly tied to TARGET, OR
+  * are computed from an explicit "from X% to Y%" or "from x kg to y kg" present in the SENTENCE.
+  If neither, DO NOT include.
 
-2) When "from X% to Y%" (HbA1c): compute ((X - Y) / X) * 100 -> include & select it.
-
-3) When "from x kg to y kg" (Body weight): compute ((x - y) / x) * 100 -> include & select it.
-
-4) For ranges like "1.2–1.5%": include both endpoints in "extracted" and prefer the HIGHER endpoint for "selected_percent".
-
-5) A percent may be extracted only if sentence contains TARGET or an adjacent sentence ties the percent to TARGET AND a reduction cue (reduced/decreased/fell/lowered/from/declined/dropped) OR it's part of from->to.
-
-6) If multiple doses reported: extract all valid changes, prefer highest-dose-associated change for "selected_percent". If association unclear, choose highest numeric percent.
-
-7) Verification: Each percent in "extracted" must be traceable (exact token in sentence or computed). If not >= 90% confident, return empty.
-
-8) Formatting: use '.' decimal, match regex ^[+-]?\\d+(?:\\.\\d+)?%$, positive values (absolute).
-
-9) Examples (must follow):
-- "HbA1c improved from 8.2% to 7.1%." -> {"extracted":["13.415%"], "selected_percent":"13.415%", "preference":"percent"}
-- "From baseline 100.0 kg to 91.5 kg, median weight decreased." -> {"extracted":["8.5%"], "selected_percent":"8.5%", "preference":"kg"}
-- "0.5 mg lowered HbA1c by 1.2-1.5% while 1.0 mg reduced 1.4-1.8%." -> {"extracted":["1.2%","1.5%","1.4%","1.8%"], "selected_percent":"1.8%", "preference":"percent"}
-- Negative examples -> return empty as explained in longer rules.
+- For "from X% to Y%" (HbA1c): compute ((X - Y) / X) * 100 and include it.
+- For "from x kg to y kg" (Body weight): compute ((x - y) / x) * 100 and include it.
+- For ranges like "1.2–1.5%": include both endpoints; prefer the HIGHER endpoint as selected.
+- A percent may be extracted only if sentence contains TARGET (or adjacent sentence ties it) AND a reduction cue, OR it's part of from->to.
+- If multiple doses reported, prefer highest-dose-associated change for selection; if unclear, choose highest numeric percent.
+- Each percent must be traceable (exact token or computed); otherwise DO NOT extract.
+- Formatting: use '.' decimal, match regex ^[+-]?\d+(?:\.\d+)?%$, positive absolute values.
+- If not confident, return {"extracted": [], "selected_percent": "", "preference": ""}
 
 Return JSON only.
 """
 
-# -------------------- New strict LLM extraction with preference --------------------
-def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = "") -> Tuple[List[str], str, List[float], List[str], str]:
+# -------------------- LLM extraction with debug & deterministic wrapper --------------------
+def llm_extract_from_sentence(model_handle, target_label: str, sentence: str, drug_hint: str = "") -> Tuple[List[str], str, List[float], List[str], str, str]:
     """
     Returns:
       - extracted (list of percent strings)
       - selected_percent (single percent string)
       - kg_list (list of kg numbers found in sentence)
       - computed_fromto_list (computed percent strings from from->to patterns)
-      - preference ('' or 'percent' or 'kg')
+      - preference ('percent'|'kg'|'')
+      - debug_json (stringified JSON containing raw_text, model_error, configure_error)
     """
-    if model is None or not sentence.strip():
+    debug_info = {"raw_text": "", "model_error": "", "configure_error": configure_error or ""}
+
+    # If model unavailable, still harvest kg tokens and computed from->to
+    if model_handle is None:
         kg_list = []
         for m in re_kg.finditer(sentence):
             num = parse_number(m.group(1))
@@ -346,9 +404,10 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                     kg_fromto_list.append(fmt_pct(((a - b) / a) * 100.0))
                 except:
                     pass
-        return [], "", kg_list, kg_fromto_list, ""
+        debug_info["model_error"] = "Model disabled or not configured."
+        return [], "", kg_list, kg_fromto_list, "", json.dumps(debug_info)
 
-    # computed reductions
+    # compute authoritative computed reductions from explicit from->to patterns
     computed = []
     if target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c'):
         for m in re_fromto.finditer(sentence):
@@ -368,9 +427,8 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
 
     allowed_via_regex = sorted(list(_allowed_percents_from_regex(sentence, target_label)))
 
-    # contextual filtering: for weight target, remove percents closer to A1c than weight
+    # contextual filter for weight target to avoid A1c bleed
     if target_label.lower().startswith('body weight') or target_label.lower().startswith('weight'):
-        percent_spans = [(m.start(), m.end(), parse_number(m.group(1))) for m in re_pct.finditer(sentence)]
         weight_pos = [m.start() for m in re_weight.finditer(sentence)]
         a1c_pos = [m.start() for m in re_hba1c.finditer(sentence)]
         def closest_distance(idx_list, pos):
@@ -390,13 +448,9 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     authoritative = list(dict.fromkeys(computed + allowed_via_regex))
 
     # harvest kg tokens
-    kg_list = []
-    for m in re_kg.finditer(sentence):
-        num = parse_number(m.group(1))
-        if not math.isnan(num):
-            kg_list.append(num)
+    kg_list = [parse_number(m.group(1)) for m in re_kg.finditer(sentence) if not math.isnan(parse_number(m.group(1)))]
 
-    # mean-decrease proximity hint
+    # detect mean-decrease proximity hint
     mean_phrases = re.search(r'\bmean\s+(?:decreas|reduc|change|decline|improv|fall)', sentence, re.IGNORECASE)
     mean_nearest_hint = ""
     if mean_phrases:
@@ -418,10 +472,10 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         elif nearest_kg:
             mean_nearest_hint = "kg"
 
-    # Prepare prompt with grounding and ask for optional preference
+    # build prompt with grounding (ALLOWED_PERCENTS)
     allowed_list_repr = ", ".join([f'"{p}"' for p in authoritative]) if authoritative else ""
     prompt_lines = [
-        f"TARGET: {target_label}",
+        f"TARGET: {target_label}"
     ]
     if drug_hint:
         prompt_lines.append(f"DRUG_HINT: {drug_hint}")
@@ -435,26 +489,31 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     prompt_lines.append("Return JSON only. Example: {\"extracted\": [\"1.2%\",\"1.5%\"], \"selected_percent\": \"1.5%\", \"preference\":\"percent\"}")
     prompt = "\n".join(prompt_lines) + "\n"
 
-    # Call LLM deterministically
-    try:
-        resp = model.generate_content(prompt, temperature=0.0)
-        text = (getattr(resp, "text", "") or "").strip()
-    except Exception:
-        return [], "", kg_list, computed, ""
+    # call model deterministically using wrapper
+    text, model_error = call_model_deterministic(model_handle, prompt)
+    debug_info["raw_text"] = text or ""
+    debug_info["model_error"] = model_error or ""
+    debug_info["configure_error"] = configure_error or ""
 
-    # Parse JSON
+    if not text:
+        # fallback: return conservative regex/computed results and debug info
+        # treat 'computed' as computed_fromto_list
+        return [], "", kg_list, computed, "", json.dumps(debug_info)
+
+    # parse JSON from model text
     try:
         s, e = text.find("{"), text.rfind("}")
         if s == -1 or e <= s:
-            return [], "", kg_list, computed, ""
+            return [], "", kg_list, computed, "", json.dumps(debug_info)
         data = json.loads(text[s:e+1])
     except Exception:
-        return [], "", kg_list, computed, ""
+        return [], "", kg_list, computed, "", json.dumps(debug_info)
 
     raw_ex = data.get("extracted", []) or []
     raw_sel = data.get("selected_percent", "") or ""
     raw_pref = (data.get("preference", "") or "").lower()
 
+    # normalize & validate extracted tokens vs authoritative
     extracted = []
     for tok in raw_ex:
         if not isinstance(tok, str):
@@ -478,16 +537,16 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
     else:
         sel = ""
 
-    # computed reductions override
+    # computed reductions override authoritative picks
     if computed:
         comp = computed[0]
         if comp not in extracted:
             extracted.insert(0, comp)
         sel = comp
         pref = "percent"
-        return extracted, sel, kg_list, computed, pref
+        return extracted, sel, kg_list, computed, pref, json.dumps(debug_info)
 
-    # Preference handling
+    # preference handling
     pref = ""
     if raw_pref in ("percent", "kg"):
         pref = raw_pref
@@ -501,9 +560,9 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         extracted = authoritative.copy()
 
     if not extracted:
-        return [], "", kg_list, computed, pref
+        return [], "", kg_list, computed, pref, json.dumps(debug_info)
 
-    return extracted, sel, kg_list, computed, pref
+    return extracted, sel, kg_list, computed, pref, json.dumps(debug_info)
 
 # -------------------- Helper: allowed percents from regex --------------------
 def _allowed_percents_from_regex(sentence: str, target_label: str) -> set:
@@ -593,7 +652,7 @@ def compute_weight_score(selected_pct_str: str):
 
 # -------------------- Processing function --------------------
 @st.cache_data
-def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, baseline_kg: float):
+def process_df(_model_handle, df_in: pd.DataFrame, text_col: str, drug_col_name: str, baseline_kg: float):
     rows = []
     for _, row in df_in.iterrows():
         text_orig = row.get(text_col, '')
@@ -620,14 +679,17 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             drug_hint = str(row.get(drug_col_name, '') or "")
 
         # HbA1c LLM extraction
-        hba_llm_extracted, hba_selected, _, _, _ = ([], "", [], [], "")
-        if _model is not None and sentence_str:
-            hba_llm_extracted, hba_selected, _, _, _ = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
+        hba_llm_extracted, hba_selected, _, _, _, hba_debug = ([], "", [], [], "", "")
+        if use_llm and _model_handle is not None and sentence_str:
+            hba_llm_extracted, hba_selected, _, _, _, hba_debug = llm_extract_from_sentence(_model_handle, "HbA1c", sentence_str, drug_hint)
+        else:
+            # no model or disabled -> leave empties; compute nothing here
+            hba_debug = json.dumps({"model_error": "Model disabled or not configured."})
 
-        # Weight LLM extraction (now returns preference too)
-        wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed, wt_pref = ([], "", [], [], "")
-        if _model is not None and weight_sentence_str:
-            wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed, wt_pref = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+        # Weight LLM extraction (returns preference and debug)
+        wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed, wt_pref, wt_debug = ([], "", [], [], "", "")
+        if use_llm and _model_handle is not None and weight_sentence_str:
+            wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed, wt_pref, wt_debug = llm_extract_from_sentence(_model_handle, "Body weight", weight_sentence_str, drug_hint)
         else:
             # parse kg tokens and computed kg-from->to when model not available
             for mkg in re_kg.finditer(weight_sentence_str):
@@ -641,7 +703,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
                         wt_kg_fromto_computed.append(fmt_pct(((a - b) / a) * 100.0))
                     except:
                         pass
+            wt_debug = json.dumps({"model_error": "Model disabled or not configured."})
 
+        # If LLM extracted is empty, ensure selected remains empty unless we have kg_fromto
         if not hba_llm_extracted:
             hba_selected = ""
 
@@ -656,7 +720,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             except:
                 pass
 
-        # ---------------- DECISION LOGIC (final) ----------------
+        # ---------------- DECISION LOGIC ----------------
         # Determine if sentence contains explicit weight percent tokens tied to weight
         sentence_has_pct = False
         for m in re_pct.finditer(weight_sentence_str):
@@ -764,12 +828,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             'Weight selected %': wt_selected,
             'Weight Score': weight_score,
             'weight_pref': wt_pref,
+            'hba_debug': hba_debug,
+            'wt_debug': wt_debug,
         })
-        if show_debug:
-            new.update({
-                'debug_kg_list': wt_kg_list,
-                'debug_kg_fromto_computed': wt_kg_fromto_computed,
-            })
         rows.append(new)
 
     out = pd.DataFrame(rows)
@@ -816,7 +877,7 @@ if drug_col and drug_col not in df.columns:
 st.success(f'Loaded {len(df)} rows. Processing...')
 
 # -------------------- Run processing --------------------
-out_df = process_df(model, df, col_name, drug_col, baseline_weight_kg)
+out_df = process_df(_model_handle if use_llm else None, df, col_name, drug_col, baseline_weight_kg)
 
 # -------------------- Reorder columns --------------------
 def insert_after(cols, after, names):
@@ -834,17 +895,18 @@ display_df = out_df.copy()
 cols = list(display_df.columns)
 cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
 cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "weight KG", "Weight selected %", "Weight Score", "weight_pref"])
+# include debug columns at end if show_debug
+if show_debug:
+    for dcol in ['hba_debug', 'wt_debug']:
+        if dcol not in cols:
+            cols.append(dcol)
 display_df = display_df[[c for c in cols if c in display_df.columns]]
 
 # -------------------- Show results --------------------
 st.write("### Results (first 200 rows shown)")
-if not show_debug:
-    for c in ['debug_kg_list', 'debug_kg_fromto_computed']:
-        if c in display_df.columns:
-            display_df = display_df.drop(columns=[c])
-
 st.dataframe(display_df.head(200))
 
+# counts
 counts = out_df.attrs.get('counts', None)
 if counts:
     kept, total = counts['kept'], counts['total']
@@ -866,6 +928,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_strict_pref_llm.xlsx',
+    file_name='results_strict_debug_llm.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
