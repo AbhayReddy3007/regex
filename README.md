@@ -7,3 +7,5 @@ This study assessed the real-world effectiveness of available GLP-1 RAs in Roman
 From a baseline range of 8.1-8.7 %, 0.5 mg dose lowered HbA1c by 1.2-1.5 %, while the 1.0 mg dose reduced it by 1.4-1.8 %.
 
 HbA1c improved from 8.2 % to 7.1 %, with total daily insulin dose decreasing from 1.4 to 0.7 IU/kg/day (p < 0.001).
+
+Median weight reduced from 100.0 kg to 91.5 kg (p<0.001), and median BMI decreased from 33.6 to 30.9 kg/m² (p<0.001). | HbA1c levels declined from 7.80% to 6.90% (p<0.001).
