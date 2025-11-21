@@ -1,16 +1,8 @@
-# streamlit_hba1c_weight_llm_with_kg_fromto_fixed.py
-# Full app with:
-# - Strict LLM rules to avoid irrelevant extractions.
-# - HbA1c: "from X% to Y%" -> relative reduction ((X-Y)/X)*100 (unchanged).
-# - Weight: "from x kg to y kg" -> relative reduction ((x - y) / x) * 100  (UPDATED to your request).
-# - If sentence contains an explicit weight %, prefer that percent.
-# - If no percent in sentence and kg from->to exists, use the kg-from->to computed percent.
-# - If no percent and no kg-from->to but kg values exist and baseline provided, compute percent = (kg_loss / baseline)*100.
-# - New column "weight KG" contains detected kg losses.
-#
-# Usage:
-#  - Set API_KEY (optional) to enable Gemini LLM.
-#  - Save and run: `streamlit run streamlit_hba1c_weight_llm_with_kg_fromto_fixed.py`
+# streamlit_strict_hba1c_weight_llm.py
+# Full app with robust LLM grounding and VERY DETAILED LLM RULES
+# - Deterministic LLM calls (temperature=0)
+# - Authoritative grounding: only allow tokens computed by regex or by explicit from->to
+# - Weight: handles percent tokens, from x->y kg (compute ((x-y)/x)*100), and baseline fallback
 
 import re
 import math
@@ -33,8 +25,8 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
-st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor (with kg from->to fixed)", layout="wide")
-st.title("HbA1c / A1c + Body Weight — regex + Gemini 2.0 Flash (reads the sentence column)")
+st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor (strict LLM)", layout="wide")
+st.title("HbA1c / A1c + Body Weight — regex + Gemini (strict, deterministic)")
 
 # -------------------- Sidebar options --------------------
 st.sidebar.header("Options")
@@ -42,7 +34,7 @@ uploaded = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx',
 col_name = st.sidebar.text_input('Column with abstracts/text', value='abstract')
 drug_col = st.sidebar.text_input('Column with drug name (optional)', value='drug_name')
 sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
-show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types, LLM_rejected)', value=False)
+show_debug = st.sidebar.checkbox('Show debug columns (raw LLM output, rejected values)', value=False)
 use_llm = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash)', value=True)
 baseline_weight_kg = st.sidebar.number_input(
     'Baseline weight for percent calc (kg)', value=70.0, min_value=1.0, step=0.1, format="%.1f"
@@ -59,7 +51,7 @@ DASH = r'(?:-|–|—)'
 
 # percent from->to (for percents)
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
-# kg from->to (NEW)
+# kg from->to
 FROM_TO_KG = rf'from\s+({NUM})\s*(?:kg|kgs|kilogram|kilograms)\s*(?:to|->|{DASH})\s*({NUM})\s*(?:kg|kgs|kilogram|kilograms)?'
 REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
 ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
@@ -160,7 +152,7 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
 # -------------------- Core extraction functions --------------------
 def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
     matches = []
-    # 1) percent from->to (already existing)
+    # 1) percent from->to
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1))
         b = parse_number(m.group(2))
@@ -175,14 +167,13 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
                 reduction_val = None
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], reduction_val)
 
-    # 1b) kg from->to — compute relative reduction using ((x - y) / x) * 100 (UPDATED)
+    # 1b) kg from->to — compute relative reduction using ((x - y) / x) * 100
     for m in re_fromto_kg.finditer(sent):
         a = parse_number(m.group(1))  # original x (kg)
         b = parse_number(m.group(2))  # new y (kg)
         reduction_val = None
         if (not math.isnan(a)) and (not math.isnan(b)) and (a != 0):
             try:
-                # standard relative reduction: ((x - y) / x) * 100
                 reduction_val = ((a - b) / a) * 100.0
             except:
                 reduction_val = None
@@ -300,33 +291,76 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# -------------------- STRICT LLM RULES --------------------
+# -------------------- DETAILED LLM RULES (very explicit) --------------------
 LLM_RULES = """
-You are an information-extraction assistant. Read the SENTENCE(S) provided and EXTRACT ONLY percentage CHANGES
-related to the specified TARGET ("HbA1c" / "A1c" / "Body weight").
+You are a strict, conservative information-extraction assistant. Read the provided SENTENCE(S) and EXTRACT ONLY percentage CHANGES that refer to the TARGET (one of: "HbA1c", "A1c", "Body weight").
 
-Return STRICT JSON only, with EXACT keys:
+OUTPUT (MANDATORY, JSON ONLY)
+Return EXACTLY a single JSON object and nothing else, with these keys:
 {
-  "extracted": ["...%", "...%"],
-  "selected_percent": "...%"
+  "extracted": ["...%", "...%"],    // array of percent strings (each must exist in the sentence OR be computed from a present from->to)
+  "selected_percent": "...%"        // single percent string chosen as the best candidate (or "" if none)
 }
 
-VERY IMPORTANT — Be conservative:
-- Extract ONLY percentages that clearly refer to the TARGET and describe a CHANGE.
-- DO NOT extract unrelated percentages (population %, p-values not representing change, baseline-only percentages).
-- If a percentage is ambiguous in context, DO NOT extract it.
-- When seeing "from X% to Y%" for HbA1c/A1c, COMPUTE THE RELATIVE REDUCTION:
-      ((X - Y) / X) * 100
-  Format it with a '%' sign (3 decimals fine), include it in "extracted" and set as "selected_percent".
-- For Body weight: when seeing "from x kg to y kg", COMPUTE THE RELATIVE REDUCTION using:
-      ((x - y) / x) * 100
-  Format with a '%' sign (3 decimals fine), include it in "extracted" and set as "selected_percent".
-- For ranges like "1.2–1.5%", include both endpoints in "extracted" and prefer the HIGHER endpoint for "selected_percent".
-- If multiple doses are present, prefer the change associated with the HIGHEST dose when choosing "selected_percent".
-- Return JSON only. If nothing valid: {"extracted": [], "selected_percent": ""}.
+VERY IMPORTANT RULES (do not break)
+1) ONLY include percentages that:
+   - are exact percent tokens present in the SENTENCE (e.g., "12.3%") AND clearly tied to the TARGET, OR
+   - are computed from an explicit "from X% to Y%" or "from x kg to y kg" pattern present in the SENTENCE (see formulas below).
+   If a percent is not present and not computable, DO NOT include it.
+
+2) When you see "from X% to Y%" and TARGET is HbA1c/A1c:
+   - Compute relative reduction = ((X - Y) / X) * 100
+   - Include the computed percent in "extracted" and set as "selected_percent".
+   - Do not use (X - Y) as the selected percent.
+
+3) When you see "from x kg to y kg" and TARGET is Body weight:
+   - Compute relative reduction = ((x - y) / x) * 100
+   - Include the computed percent in "extracted" and set as "selected_percent".
+
+4) For ranges like "1.2–1.5%" or "1.2 to 1.5%":
+   - Add both endpoints to "extracted" (e.g., ["1.2%","1.5%"]).
+   - Prefer the HIGHER endpoint as "selected_percent" unless a computed from->to exists.
+
+5) Proximity / context:
+   - A percent token can be extracted only if:
+     a) The sentence contains the TARGET term (or an immediately adjacent sentence ties the percent to the TARGET), AND
+     b) The sentence contains a reduction cue (reduced/decreased/fell/lowered/from/declined/dropped), OR the percent is part of a from->to pattern.
+   - If percent is clearly unrelated (p-values, percent of patients, CI bounds), DO NOT extract.
+
+6) Dose handling:
+   - If multiple doses appear, extract valid percent-changes and prefer the percent for the HIGHEST dose when choosing selected_percent.
+   - If dose association cannot be established, choose the highest numeric percent.
+
+7) Verification (critical):
+   - For every percent you add to "extracted", you must either:
+     a) locate the exact percent token in the SENTENCE (after normalization), OR
+     b) compute it from an explicit from->to present in the sentence.
+   - If you cannot demonstrate either, DO NOT extract.
+
+8) Formatting:
+   - Use '.' for decimals.
+   - Strings must match regex: ^[+-]?\d+(?:\.\d+)?%$
+   - No '<', '>', '≥', '≤', 'p-value' tokens, or extra text in percent strings.
+   - Return positive values (absolute).
+
+9) Ambiguity:
+   - If not >= 90% confident that a percent follows these rules, return {"extracted": [], "selected_percent": ""}.
+
+Examples (required outputs):
+1) "HbA1c improved from 8.2% to 7.1%." -> {"extracted":["13.415%"], "selected_percent":"13.415%"}
+2) "From baseline 100.0 kg to 91.5 kg, median weight decreased." -> {"extracted":["8.5%"], "selected_percent":"8.5%"}
+3) "0.5 mg lowered HbA1c by 1.2-1.5% while 1.0 mg reduced 1.4-1.8%." -> {"extracted":["1.2%","1.5%","1.4%","1.8%"], "selected_percent":"1.8%"}
+4) "Body weight decreased by 12.3% (p<0.001)." -> {"extracted":["12.3%"], "selected_percent":"12.3%"}
+
+Negative examples (must return empty):
+- "p=0.03, weight reduction significant." => {"extracted": [], "selected_percent": ""}
+- "50% of patients achieved response." => {"extracted": [], "selected_percent": ""}
+- "HbA1c baseline was 8.2%." => {"extracted": [], "selected_percent": ""}
+
+FINAL: Return JSON only and nothing else.
 """
 
-# -------------------- LLM extraction (returns percents, selected, kg_list, kg_fromto_computed_list) --------------------
+# -------------------- LLM extraction (strict, deterministic) --------------------
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = "") -> Tuple[List[str], str, List[float], List[str]]:
     """
     Returns:
@@ -335,19 +369,18 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
       - kg_list (list of floats found in LLM output or sentence),
       - kg_fromto_computed_list (list of percent strings computed from 'from x kg to y kg' found by regex)
     Behavior:
-      - If 'from X% to Y%' (HbA1c) exists -> compute ((X-Y)/X)*100 and force it.
-      - If 'from x kg to y kg' exists -> compute ((x - y) / x)*100 and force it for Body weight.
-      - Baseline-based percent (sidebar) is used only when no kg-from->to computed reduction exists and no percent exists in sentence.
+      - Precompute authoritative set (regex-found percents + computed from->to reductions).
+      - Pass ALLOWED_PERCENTS into prompt and set temperature=0.
+      - Strictly accept only values from authoritative set or computed-from->to values.
     """
-    # If model unavailable: still parse kg in sentence for fallback
     if model is None or not sentence.strip():
+        # still detect kg in sentence and kg-from->to computed values when model is not available
         kg_list = []
         kg_fromto_list = []
         for m in re_kg.finditer(sentence):
             num = parse_number(m.group(1))
             if not math.isnan(num):
                 kg_list.append(num)
-        # computed kg-from->to via regex (updated formula)
         for m in re_fromto_kg.finditer(sentence):
             a = parse_number(m.group(1)); b = parse_number(m.group(2))
             if not (math.isnan(a) or math.isnan(b)) and a != 0:
@@ -358,162 +391,143 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                     pass
         return [], "", kg_list, kg_fromto_list
 
-    # 1) Compute authoritative reductions present in the sentence
-    computed_hba1c_reductions = []
-    computed_weight_fromto_reductions = []
+    # Build authoritative sets
+    authoritative = []
 
-    # HbA1c percent from->to (existing)
-    if (target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c')):
-        for m_ft in re_fromto.finditer(sentence):
-            a = parse_number(m_ft.group(1)); b = parse_number(m_ft.group(2))
+    # 1) computed reductions from explicit from->to in sentence (highest priority)
+    computed = []
+    # HbA1c percent from->to
+    if target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c'):
+        for m in re_fromto.finditer(sentence):
+            a = parse_number(m.group(1)); b = parse_number(m.group(2))
             if not (math.isnan(a) or math.isnan(b)) and a != 0:
                 try:
-                    rel = ((a - b) / a) * 100.0
-                    computed_hba1c_reductions.append(fmt_pct(rel))
+                    computed.append(fmt_pct(((a - b) / a) * 100.0))
                 except:
                     pass
-
-    # Weight kg from->to (UPDATED per user formula ((x - y)/x)*100)
-    for m_kg in re_fromto_kg.finditer(sentence):
-        a = parse_number(m_kg.group(1)); b = parse_number(m_kg.group(2))
+    # weight kg from->to
+    for m in re_fromto_kg.finditer(sentence):
+        a = parse_number(m.group(1)); b = parse_number(m.group(2))
         if not (math.isnan(a) or math.isnan(b)) and a != 0:
             try:
-                rel_w = ((a - b) / a) * 100.0
-                computed_weight_fromto_reductions.append(fmt_pct(rel_w))
+                computed.append(fmt_pct(((a - b) / a) * 100.0))
             except:
                 pass
 
-    # 2) Build prompt and call LLM
-    prompt = (
-        f"TARGET: {target_label}\n"
-        + (f"DRUG_HINT: {drug_hint}\n" if drug_hint else "")
-        + LLM_RULES + "\n"
-        + "SENTENCE:\n" + sentence + "\n"
-        + "Return JSON only.\n"
-    )
+    # 2) regex-found percents and ranges
+    allowed_via_regex = sorted(list(_allowed_percents_from_regex(sentence, target_label)))
+    # authoritative: computed first then regex tokens (computed wins)
+    authoritative = list(dict.fromkeys(computed + allowed_via_regex))
 
+    # Also harvest kg tokens directly from sentence (for baseline fallback)
+    kg_list = []
+    for m in re_kg.finditer(sentence):
+        num = parse_number(m.group(1))
+        if not math.isnan(num):
+            kg_list.append(num)
+
+    # Prepare prompt with grounding
+    allowed_list_repr = ", ".join([f'"{p}"' for p in authoritative]) if authoritative else ""
+    prompt_lines = []
+    prompt_lines.append(f"TARGET: {target_label}")
+    if drug_hint:
+        prompt_lines.append(f"DRUG_HINT: {drug_hint}")
+    prompt_lines.append(f"ALLOWED_PERCENTS: [{allowed_list_repr}]")
+    prompt_lines.append("IMPORTANT: You MUST ONLY return JSON with keys 'extracted' and 'selected_percent'.")
+    prompt_lines.append("You may only choose values from ALLOWED_PERCENTS or compute values from an explicit from->to pattern present in the SENTENCE.")
+    prompt_lines.append(LLM_RULES)
+    prompt_lines.append("SENTENCE:")
+    prompt_lines.append(sentence)
+    prompt = "\n".join(prompt_lines) + "\nReturn JSON only.\n"
+
+    # Call model deterministically
     text = ""
     try:
-        resp = model.generate_content(prompt)
+        # Using generate_content with temperature=0.0 for deterministic output (SDK parameter)
+        # If your SDK uses other param names adapt accordingly
+        resp = model.generate_content(prompt, temperature=0.0)
         text = (getattr(resp, "text", "") or "").strip()
     except Exception:
-        text = ""
+        # model call failed -> return nothing but still include kg list
+        return [], "", kg_list, computed
 
-    # parse LLM JSON
+    # Parse JSON returned by LLM
     extracted_raw = []
     selected_raw = ""
     try:
-        if text:
-            s, e = text.find("{"), text.rfind("}")
-            if s != -1 and e > s:
-                data = json.loads(text[s:e+1])
-                raw_ex = data.get("extracted") or []
-                for x in raw_ex:
-                    if isinstance(x, str):
-                        extracted_raw.append(x.strip())
-                selected_raw = (data.get("selected_percent") or "") or ""
+        s, e = text.find("{"), text.rfind("}")
+        if s == -1 or e <= s:
+            return [], "", kg_list, computed
+        data = json.loads(text[s:e+1])
+        raw_ex = data.get("extracted") or []
+        for x in raw_ex:
+            if isinstance(x, str):
+                extracted_raw.append(x.strip())
+        selected_raw = (data.get("selected_percent") or "") or ""
     except Exception:
-        extracted_raw = []
-        selected_raw = ""
+        # parsing failed
+        return [], "", kg_list, computed
 
-    # normalize percents and extract kg mentions from LLM tokens
+    # Normalize and validate LLM outputs against authoritative set
     extracted = []
-    kg_list = []
+    validated_rejected = []  # for debug
     for tok in extracted_raw:
-        # detect kg inside LLM token (e.g., "2 kg")
-        for m in re_kg.finditer(tok):
-            num = parse_number(m.group(1))
-            if not math.isnan(num):
-                kg_list.append(num)
-        xn = _norm_percent(tok)
-        if re.search(r'[<>≥≤]', xn):
+        xn = _norm_percent(tok).replace(',', '.')
+        if not re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', xn):
+            validated_rejected.append(tok)
             continue
-        if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', xn):
+        # make absolute and format
+        try:
+            val = abs(parse_number(xn.replace('%', '')))
+            xn = fmt_pct(val)
+        except:
+            validated_rejected.append(tok)
+            continue
+        if xn in authoritative:
             extracted.append(xn)
+        else:
+            # not in authoritative -> reject
+            validated_rejected.append(tok)
 
-    # also harvest kg from sentence as backup
-    if not kg_list:
-        for m in re_kg.finditer(sentence):
-            num = parse_number(m.group(1))
-            if not math.isnan(num):
-                kg_list.append(num)
+    sel = _norm_percent(selected_raw).replace(',', '.')
+    if sel and re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', sel):
+        try:
+            sel_val = abs(parse_number(sel.replace('%', '')))
+            sel = fmt_pct(sel_val)
+        except:
+            sel = ""
+    else:
+        sel = ""
 
-    # 3) FORCE computed reductions if present
-    # HbA1c computed reductions (highest priority for HbA1c target)
-    if computed_hba1c_reductions and (target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c')):
-        comp = computed_hba1c_reductions[0]
+    # If computed reductions exist, force them (highest priority)
+    if computed:
+        comp = computed[0]
         if comp not in extracted:
             extracted.insert(0, comp)
-        selected = comp
-        # final cleanup and return (we don't need kg info here)
-        extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-        return extracted, selected, kg_list, []
+        sel = comp
 
-    # Weight kg-from->to computed reductions (force for Body weight target)
-    if computed_weight_fromto_reductions and (target_label.lower().startswith('body weight') or target_label.lower().startswith('weight')):
-        compw = computed_weight_fromto_reductions[0]
-        if compw not in extracted:
-            extracted.insert(0, compw)
-        selected = compw
-        return [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)], selected, kg_list, computed_weight_fromto_reductions
+    # If selected provided by LLM but not authoritative, reject selection
+    if sel and (sel not in authoritative):
+        # reject; prefer authoritative first element if available
+        if authoritative:
+            sel = authoritative[0]
+            if sel not in extracted:
+                extracted.insert(0, sel)
+        else:
+            sel = ""
 
-    # 4) No forced computed reductions: validate LLM percents against regex allowed set
-    allowed_set = _allowed_percents_from_regex(sentence, target_label)
+    # Final cleanup: ensure unique extracted and valid pattern
+    uniq_extracted = []
+    for e in extracted:
+        if e not in uniq_extracted:
+            uniq_extracted.append(e)
+    extracted = uniq_extracted
 
-    # Filter LLM-extracted percents: only keep those present in allowed_set (strict)
-    if allowed_set:
-        extracted = [e for e in extracted if e in allowed_set]
-        selected = _norm_percent(selected_raw)
-        if selected not in allowed_set:
-            selected = ""
-    else:
-        selected = _norm_percent(selected_raw)
-
-    # fallback proximity check if nothing matched but LLM provided percents
-    if not extracted and extracted_raw:
-        term_re = re_hba1c if (target_label.lower().startswith('hba1c') or target_label.lower().startswith('a1c')) else re_weight
-        positions = [m.start() for m in term_re.finditer(sentence)]
-        if positions:
-            prox_allowed = []
-            for tok in extracted_raw:
-                xn = _norm_percent(tok)
-                if not re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', xn):
-                    continue
-                ex_plain = xn.replace('%', '')
-                found_near = False
-                for p in positions:
-                    left = max(0, p - 120)
-                    right = min(len(sentence), p + 120)
-                    window = sentence[left:right]
-                    if re.search(re.escape(ex_plain) + r'\s*%', window):
-                        found_near = True
-                        break
-                if found_near:
-                    prox_allowed.append(xn)
-            extracted = prox_allowed
-            if selected and selected not in extracted:
-                selected = ""
-
-    # final selection: if still empty, return empty (conservative)
+    # If nothing valid extracted, return empty (conservative)
     if not extracted:
-        return [], "", kg_list, []
+        return [], "", kg_list, computed
 
-    if not selected:
-        max_val = None
-        for ex in extracted:
-            try:
-                num = parse_number(ex.replace('%', ''))
-                if math.isnan(num):
-                    continue
-                if max_val is None or num > max_val:
-                    max_val = num
-            except:
-                continue
-        if max_val is not None:
-            selected = fmt_pct(max_val)
-
-    extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-    return extracted, selected, kg_list, []
+    return extracted, sel, kg_list, computed
 
 # Helper: build allowed set from regex (used in validation)
 def _allowed_percents_from_regex(sentence: str, target_label: str) -> set:
@@ -640,7 +654,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected, wt_kg_list, wt_kg_fromto_computed = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
         else:
-            # even without model, detect kg in sentence and kg-from->to computed reductions (using updated formula)
+            # even without model, detect kg in sentence and kg-from->to computed reductions
             for mkg in re_kg.finditer(weight_sentence_str):
                 num = parse_number(mkg.group(1))
                 if not math.isnan(num):
@@ -669,10 +683,10 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             except:
                 pass
 
-        # ---------------- DECISION LOGIC (per user request) ----------------
+        # ---------------- DECISION LOGIC ----------------
         # Priority:
-        # 1) If sentence contains any explicit percent tokens for weight -> use percent (prefer LLM selected if present; else use regex max).
-        # 2) Else (no percent in sentence):
+        # 1) If sentence contains explicit percent tokens for weight -> use percent (prefer LLM selected; else regex max).
+        # 2) Else if no percent tokens:
         #    a) If kg-from->to computed exists -> use that computed percent (forced).
         #    b) Else if kg_list exists and baseline provided -> compute percent from baseline and use that.
         #    c) Else leave wt_selected as-is.
@@ -680,9 +694,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
         sentence_has_pct = bool(re_pct.search(weight_sentence_str))
 
         if sentence_has_pct:
-            # Prefer any LLM-selected percent (it should have been validated earlier)
+            # Prefer any LLM-selected percent (validated earlier)
             if wt_selected:
-                pass  # keep it
+                pass
             else:
                 # pick numeric max percent found in the sentence by regex
                 pct_vals = []
@@ -695,17 +709,15 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
                     wt_selected = fmt_pct(max_pct)
                     if wt_selected not in wt_llm_extracted:
                         wt_llm_extracted.insert(0, wt_selected)
-            # Do NOT use kg-from->to or baseline in this branch
+            # do NOT use kg-from->to or baseline in this branch
         else:
             # no percent token in sentence -> try kg-from->to first (if present), else baseline-based kg -> percent
             if wt_kg_fromto_computed:
-                # use the first computed kg-from->to percent
                 chosen = wt_kg_fromto_computed[0]
                 if chosen not in wt_llm_extracted:
                     wt_llm_extracted.insert(0, chosen)
                 wt_selected = chosen
             else:
-                # no kg-from->to computed reductions -> fallback to baseline if kg values exist
                 if wt_kg_list and baseline_kg and baseline_kg > 0:
                     max_kg = max(wt_kg_list)
                     pct_from_baseline = (max_kg / float(baseline_kg)) * 100.0
@@ -713,7 +725,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
                     if wt_selected not in wt_llm_extracted:
                         wt_llm_extracted.insert(0, wt_selected)
                 else:
-                    # nothing to override; keep whatever wt_selected currently is (likely empty)
                     pass
 
         # Ensure selected% formatted & positive
@@ -749,6 +760,12 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, b
             'Weight selected %': wt_selected,
             'Weight Score': weight_score,
         })
+        if show_debug:
+            # include raw debug info for troubleshooting
+            new.update({
+                'debug_kg_list': wt_kg_list,
+                'debug_kg_fromto_computed': wt_kg_fromto_computed,
+            })
         rows.append(new)
 
     out = pd.DataFrame(rows)
@@ -817,8 +834,9 @@ display_df = display_df[[c for c in cols if c in display_df.columns]]
 
 # -------------------- Show results --------------------
 st.write("### Results (first 200 rows shown)")
+# drop internal debug columns by default
 if not show_debug:
-    for c in ['reductions_pp', 'reduction_types', 'weight_reductions_pp', 'weight_reduction_types', 'LLM_rejected']:
+    for c in ['debug_kg_list', 'debug_kg_fromto_computed']:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
 
@@ -846,6 +864,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_with_llm_and_weightkg_fromto_fixed.xlsx',
+    file_name='results_with_strict_llm.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
