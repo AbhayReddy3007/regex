@@ -89,6 +89,41 @@ def fmt_pct(v):
     s = f"{float(v):.2f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
+# Duration extraction helper (new)
+DURATION_RE = re.compile(
+    r'\b(?:T\d{1,2}|'                                       # T6, T12
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:weeks?|wks?|wk|w)\b|'   # 12 weeks, 6-12 weeks
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:months?|mos?|mo)\b|'    # 6 months, 12-mo, 6-12 months
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:days?|d)\b|'            # days
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:years?|yrs?)\b|'        # years
+    r'\d{1,3}-week\b|\d{1,3}-month\b|\d{1,3}-mo\b)',         # hyphenated forms
+    FLAGS
+)
+
+def extract_durations(text: str) -> str:
+    """Return a deduped, ordered string of duration mentions found in text separated by ' | '."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    found = []
+    seen = set()
+    for m in DURATION_RE.finditer(text):
+        token = m.group(0).strip()
+        # normalize whitespace and hyphens
+        token = re.sub(r'\s+', ' ', token)
+        token = token.replace('–', '-').replace('—', '-')
+        # normalize common abbreviations
+        token = re.sub(r'\bmos?\b', 'months', token, flags=re.IGNORECASE)
+        token = re.sub(r'\bmo\b', 'months', token, flags=re.IGNORECASE)
+        token = re.sub(r'\bwks?\b', 'weeks', token, flags=re.IGNORECASE)
+        token = re.sub(r'\bw\b', 'weeks', token, flags=re.IGNORECASE)
+        token = re.sub(r'\bd\b', 'days', token, flags=re.IGNORECASE)
+        token = re.sub(r'\byrs?\b', 'years', token, flags=re.IGNORECASE)
+        token = token.strip()
+        if token.lower() not in seen:
+            seen.add(token.lower())
+            found.append(token)
+    return ' | '.join(found)
+
 # --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
@@ -142,76 +177,6 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
         'sentence_index': si,
         'span': (abs_start + (m.start() if hasattr(m, 'start') else 0), abs_start + (m.end() if hasattr(m, 'end') else 0)),
     })
-
-# -------------------- Duration extractor --------------------
-def extract_durations_from_text(text: str):
-    """
-    Finds duration phrases in text and returns a list of normalized strings.
-    Examples matched/normalized:
-      '12 months', '6 months', '52 weeks', '4 weeks',
-      '12-mo' -> '12 months'
-      '6-mo' -> '6 months'
-      '12-wk' -> '12 weeks'
-      'T6', 'T12'
-      'week 36'
-      '12-24 weeks' or '12–24 weeks'
-    """
-    if not isinstance(text, str) or not text.strip():
-        return []
-
-    t = text
-    results = []
-
-    # 1) Ranges with unit, e.g., "12-24 weeks", "6–12 mo"
-    range_re = re.compile(r'(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*(mo|month|months|wk|w|week|weeks|m)\b', FLAGS)
-    for m in range_re.finditer(t):
-        a = m.group(1).replace(',', '.').replace('·', '.')
-        b = m.group(2).replace(',', '.').replace('·', '.')
-        unit = m.group(3).lower()
-        unit_norm = 'months' if unit.startswith('mo') or unit == 'm' else 'weeks'
-        results.append(f"{a}-{b} {unit_norm}")
-
-    # 2) Explicit T# patterns (T6, T12) possibly with space: "T6", "T 12"
-    t_re = re.compile(r'\bT\s*0*(\d+)\b', FLAGS)
-    for m in t_re.finditer(t):
-        results.append(f"T{m.group(1)}")
-
-    # 3) Simple numeric + unit: "12 months", "6 mo", "4 weeks", "12-wk", "12wk"
-    simple_re = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:-)?\s*(mo|month|months|wk|w|week|weeks|m)\b', FLAGS)
-    for m in simple_re.finditer(t):
-        num = m.group(1).replace(',', '.').replace('·', '.')
-        unit = m.group(2).lower()
-        unit_norm = 'months' if unit.startswith('mo') or unit == 'm' else 'weeks'
-        # Avoid duplicating ranges (they already captured)
-        entry = f"{num} {unit_norm}"
-        if entry not in results:
-            results.append(entry)
-
-    # 4) Patterns like "week 36" or "at week 36"
-    weeknum_re = re.compile(r'\bweek\s+(\d+)\b', FLAGS)
-    for m in weeknum_re.finditer(t):
-        results.append(f"week {m.group(1)}")
-
-    # 5) Shorthand like "12-mo", "24-wk", "52-week", covered by simple_re but catch extra hyphenated forms:
-    hyphen_re = re.compile(r'\b(\d+)\s*[-–]\s*(mo|wk|w|month|week|months|weeks)\b', FLAGS)
-    for m in hyphen_re.finditer(t):
-        num = m.group(1)
-        unit = m.group(2).lower()
-        unit_norm = 'months' if unit.startswith('mo') else 'weeks'
-        entry = f"{num} {unit_norm}"
-        if entry not in results:
-            results.append(entry)
-
-    # Normalize order and uniqueness preserving first occurrence order
-    seen = set()
-    normalized = []
-    for item in results:
-        item_norm = item.replace('  ', ' ').strip()
-        if item_norm not in seen:
-            seen.add(item_norm)
-            normalized.append(item_norm)
-
-    return normalized
 
 # -------------------- Core extraction --------------------
 def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str):
@@ -627,6 +592,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if not isinstance(text_orig, str):
             text_orig = '' if pd.isna(text_orig) else str(text_orig)
 
+        # Extract duration info (new)
+        duration_str = extract_durations(text_orig)
+
         # Run regex extraction
         hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c')
         wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight')
@@ -854,10 +822,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(final_wt_selected_pct)
 
-        # -------------------- Duration extraction for this row --------------------
-        durations = extract_durations_from_text(text_orig)
-        duration_str = ' | '.join(durations) if durations else ''
-
         new = row.to_dict()
         new.update({
             'sentence': sentence_str,
@@ -870,7 +834,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'Weight LLM extracted': wt_llm_extracted,
             'Weight selected %': final_wt_selected_pct,
             'Weight Score': weight_score,
-            'Duration': duration_str,  # <-- new column added here
+            'duration': duration_str,  # NEW column appended here
         })
         rows.append(new)
 
@@ -922,11 +886,13 @@ for c in cols:
     if c not in seen:
         new_cols.append(c)
         seen.add(c)
-# Ensure 'Duration' is the last column (if present)
-if 'Duration' in new_cols:
-    new_cols = [c for c in new_cols if c != 'Duration'] + ['Duration']
-
 display_df = display_df[new_cols]
+
+# Ensure 'duration' is the last column (move to end if present)
+if 'duration' in display_df.columns:
+    cols_no_duration = [c for c in display_df.columns if c != 'duration']
+    cols_no_duration.append('duration')
+    display_df = display_df[cols_no_duration]
 
 # -------------------- Show results --------------------
 st.write("### Results (first 200 rows shown)")
@@ -940,4 +906,25 @@ st.dataframe(display_df.head(200))
 # counts
 counts = out_df.attrs.get('counts', None)
 if counts:
-    kept
+    kept, total = counts['kept'], counts['total']
+    st.caption(
+        f"Kept {kept} of {total} rows ({(kept/total if total else 0):.1%}).  "
+        f"HbA1c-only: {counts['hba_only']}, Weight-only: {counts['wt_only']}, Both: {counts['both']}"
+    )
+
+# -------------------- Download --------------------
+@st.cache_data
+def to_excel_bytes(df_out):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_out.to_excel(writer, index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+excel_bytes = to_excel_bytes(display_df)
+st.download_button(
+    'Download results as Excel',
+    data=excel_bytes,
+    file_name='results_with_llm_from_sentence.xlsx',
+    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+)
