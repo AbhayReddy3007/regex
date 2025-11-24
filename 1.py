@@ -10,6 +10,9 @@ import streamlit as st
 API_KEY = ""   # <- replace with your real key
 # =========================================================================
 
+# Baseline weight for converting kg -> percent (user provided)
+BASELINE_WEIGHT = 105.0  # kg
+
 # Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
 try:
@@ -18,7 +21,7 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
-st.set_page_config(page_title="HbA1c & Weight % Reduction Extractor", layout="wide")
+st.set_page_config(page_title="HbA1c & Weight %/kg Reduction Extractor", layout="wide")
 st.title("HbA1c / A1c + Body Weight — regex + Gemini 2.0 Flash (reads the sentence column)")
 
 # -------------------- Regex helpers --------------------
@@ -44,7 +47,7 @@ re_reduction_cue = re.compile(
     r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b',
     FLAGS
 )
-# New: units for weight (kg/kilogram)
+# units for weight (kg/kilogram)
 re_weight_unit = re.compile(r'\bkg\b|\bkilograms?\b', FLAGS)
 
 # -------------------- Utilities --------------------
@@ -157,11 +160,23 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp)
+    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp) AND relative %
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
         red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
+        # ALSO compute relative reduction % = ((a - b) / a) * 100  (if a != 0)
+        if not (math.isnan(a) or math.isnan(b)) and a != 0:
+            rel = ((a - b) / a) * 100.0
+            rel_raw = f"{rel:.3f}%"
+            matches.append({
+                'raw': rel_raw,
+                'type': f'{tag_prefix}:from-to_relative_percent',
+                'values': [a, b, rel],
+                'reduction_pp': red,
+                'sentence_index': si,
+                'span': (0, 0),
+            })
 
     # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
     any_window_hit = False
@@ -306,87 +321,33 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# LLM prompt & extraction
+# LLM prompt & extraction (now allows kg)
 LLM_RULES = """
-You are an information-extraction assistant. Read the SENTENCE(S) provided and **extract only percentage CHANGES** that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
+You are an information-extraction assistant. Read the SENTENCE(S) provided and extract percentage CHANGES and/or absolute weight CHANGES (kg) that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
 
 OUTPUT FORMAT (exact JSON):
 {
-  "extracted": ["1.23%", "0.85%"],      // array of strings (percent with % sign) — values the LLM finds relevant in the sentence(s)
-  "selected_percent": "1.23%"           // single string (percent) the LLM chooses as the *best* value for the sentence(s) and target
+  "extracted": ["1.23%", "3.5 kg"],      // array of strings — may contain percent values (e.g. "1.23%") and/or kg values (e.g. "3.5 kg")
+  "selected_percent": "1.23%",           // single string: the best percent value (optional; empty string if none)
+  "selected_kg": "3.5 kg"                // OPTIONAL single string: the best kg value (optional; empty string or omitted if none)
 }
 
 GENERAL PRINCIPLES
-1. Normalize numbers:
-   - Convert decimal separators to a period (e.g., "13·88", "13,88" -> "13.88").
-   - Remove typographic artifacts (e.g., "Â·", "â‰¥") and normalize spacing.
-   - Always return percentages with a trailing '%' and use dot decimals (e.g., "13.88%").
+- Keep the previous percent-handling rules: normalization (13·88 or 13,88 -> 13.88), ignore thresholds (>=, <), compute from X%->Y% as X-Y, prefer within-group over between-group, timepoint preference (T12 > T6), exclude SE/p-values/CIs, sign handling (selected_percent must be positive).
+- ADDED: When the sentence reports absolute weight changes in kilograms (e.g., "mean decrease of 3.64 kg" or "reduced by 3.5 kg"), include those values in the `extracted` array formatted as strings with a trailing ' kg' (use dot as decimal separator, e.g., "3.64 kg").
+- If both percent and kg values are present, include both in `extracted` and set `selected_percent` and/or `selected_kg` to indicate the LLM's best choice for each unit. (Note: the app will prefer kg over % when both exist and will convert kg→% using the baseline weight for scoring.)
+- For `selected_kg`, return the absolute magnitude as a string with a ' kg' suffix (no sign). If no kg value is relevant, either omit `selected_kg` or set it to an empty string.
 
-2. Only extract *change percentages* (reductions or increases) relevant to the TARGET:
-   - Accept formats like "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "from 8.5% to 7.5%" (see computation rule below).
-   - **Ignore** statistics that are not change values: standard errors (SE), p-values, CIs, prevalence/threshold statements (e.g., ">=5%", "HbA1c < 7.0%"), proportions (e.g., "proportion achieving >=5%"), and labels such as "SE 0.90" or "(p<0.001)".
-   - If a percentage is clearly a threshold, target, or eligibility cutoff (e.g., "HbA1c < 7.0%", "weight loss >=5%"), do NOT treat it as a reduction — do not include it.
-
-3. "from X% to Y%" / "declined from X% to Y%" / "improved from X% to Y%":
-   - Compute and return the difference as (X - Y) percentage points.
-   - Example: "declined from 8.5% to 7.0%" → extracted should include "1.5%" (and selected may be "1.5%" if it is the best).
-   - Maintain sign-neutral output for `selected_percent` (see rule on sign). In the `extracted` array you may include the computed value with %.
-
-4. Prefer the within-group (drug) change over between-group difference:
-   - If a sentence contains both a within-group percent for a drug (e.g., "semaglutide yielded 13.88% body weight reduction") **and** a between-group difference (e.g., "between-group difference: -13.46%"), **prefer the within-group percent** for the drug’s selected value.
-   - Only select a between-group value if no within-group value for the requested drug is present in the sentence.
-
-5. Respect drug context when multiple drugs are mentioned:
-   - If a `drug_name` is provided externally, use it to pick the value(s) that belong to that drug.
-   - Choose the percent that is attached/closest to that drug mention or the percent that is explicitly described for that drug group (e.g., "in the oral semaglutide group ... -1.75%").
-   - If multiple values exist for different drugs in the same sentence, **do not** guess — use `drug_name` to decide which value to extract/choose.
-
-6. Timepoint preference (T12 over T6):
-   - If the sentence mentions multiple timepoints, prefer values reported at **12 months** (or T12, 12-mo, month 12) over **6 months** (T6, 6-mo, month 6).
-   - If multiple values for the same target exist at different timepoints, include all as `extracted` but choose the **selected_percent** based on the timepoint preference (T12 > T6 > unspecified).
-   - If a specific timepoint is not referenced, treat values as general and apply the other rules.
-
-7. Avoid picking spurious percentages:
-   - Exclude SE (e.g., "(SE 0.90)"), p-values, confidence intervals, sample-size percentages, age/age-range percentages, and threshold conditions. Only include percentages that clearly denote change magnitude for the target.
-   - If a percent appears in parentheses immediately after a metric but is unclear (e.g., "(SE 0·90)"), do NOT include it.
-
-8. Sign handling:
-   - For `extracted` you may capture negative values if they appear, but `selected_percent` **must be returned as a positive value** (absolute magnitude) with '%' sign.
-   - If the sentence indicates a decrease as "-1.75%" or "reduction of 1.75%", the `selected_percent` should be "1.75%".
-
-9. When no valid change percent is found:
-   - Return `"extracted": []` and `"selected_percent": ""` (empty string). Do not fall back to regex candidates or heuristics outside of the sentence context.
-
-10. JSON strictness:
-    - Return exactly one JSON object with only the two keys: `extracted` (array) and `selected_percent` (string). No extra text, commentary or explanation.
-    - Percent strings must include the '%' sign. If `selected_percent` is empty, it must be the empty string not null.
-
-11. Examples (behavioral):
-    - SENTENCE: "At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% ... (between-group difference: -13·46%)"
-      → `extracted` should include "13.88%" (within-group) and may include "13.46%" as an additional extracted value, BUT `selected_percent` should be "13.88%" for the drug (because within-group value attached to the drug is preferred).
-    - SENTENCE: "Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% ... and -3.64 kg ... in the oral semaglutide group..."
-      → For HbA1c extraction: `extracted` includes "1.75%"; `selected_percent` "1.75%".
-    - SENTENCE: "Coprimary endpoints were percent bodyweight change and proportion reaching >=5% bodyweight reduction."
-      → `extracted` is `[]` and `selected_percent` is `""` because the sentence defines endpoints or thresholds, not a reported reduction magnitude.
-
-12. Additional robustness:
-    - Normalize unusual characters (e.g., handle "13·88" or "13,88" as 13.88).
-    - If a percent is formatted with thousand separators or nonstandard punctuation, normalize before returning.
-
-FALLBACK / EDGE CASES
-- If sentence includes multiple valid reduction percentages for the same drug and same timepoint, include them all in `extracted` and choose the most prominently stated one as `selected_percent` (prominence = explicit "reduced by X%", or value directly attached to the drug phrase, or the T12 timepoint per rule 6).
-- If drug_name is not provided and multiple drugs are present, select the percent that is most directly tied to the target phrase (e.g., "% body weight reduction" adjacent to a drug mention). If ambiguity remains, return all extracted candidates and leave `selected_percent` empty.
-
-That is all. RETURN ONLY THE JSON OBJECT (no explanation)."""
-
+JSON strictness: return only the JSON object (no commentary).
+"""
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
-    Returns (extracted_list (strings like '1.23%'), selected_percent (string like '1.23%') )
-    If model is None, returns ([], '')
+    Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_kg (string like '3.5 kg'))
+    If model is None, returns ([], '', '')
     """
     if model is None or not sentence.strip():
-        return [], ""
+        return [], "", ""
 
     prompt = (
         f"TARGET: {target_label}\n"
@@ -404,33 +365,56 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if s != -1 and e > s:
             data = json.loads(text[s:e+1])
             extracted = []
+            # parse returned extracted list — accept both percent and kg strings
             for x in (data.get("extracted") or []):
-                if isinstance(x, str):
-                    x = _norm_percent(x)
-                    # ignore thresholds, like "<7.0%" or ">=5%" that are not reductions
-                    if re.search(r'[<>≥≤]', x):
+                if not isinstance(x, str):
+                    continue
+                x = x.strip()
+                # kg values
+                if re.search(r'\bkg\b', x, re.IGNORECASE):
+                    m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', x)
+                    if m:
+                        num = parse_number(m.group(1))
+                        if not math.isnan(num):
+                            s_num = f"{num:.3f}".rstrip('0').rstrip('.')
+                            extracted.append(f"{s_num} kg")
+                else:
+                    # percent values
+                    x2 = _norm_percent(x)
+                    if re.search(r'[<>≥≤]', x2):
                         continue
-                    extracted.append(x)
+                    if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
+                        extracted.append(x2)
+
+            # selected percent (normalized & absolute)
             selected = _norm_percent(data.get("selected_percent", "") or "")
-            # convert negative selected to positive absolute (as requested)
             if selected:
-                # remove % and parse
                 try:
                     num = parse_number(selected.replace('%', ''))
                     if not math.isnan(num):
                         num = abs(num)
                         selected = fmt_pct(num)
                 except:
-                    pass
-            # ensure extracted entries are normalized (and not thresholds)
-            extracted = [e for e in extracted if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', e)]
-            # If selected is not in extracted, keep it anyway (you asked to allow cleaned values)
-            return extracted, selected
+                    selected = ""
+
+            # selected kg (optional)
+            selected_kg = ""
+            if 'selected_kg' in data:
+                sk = (data.get('selected_kg') or "").strip()
+                if sk:
+                    m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', sk)
+                    if m:
+                        num = parse_number(m.group(1))
+                        if not math.isnan(num):
+                            s_num = f"{num:.3f}".rstrip('0').rstrip('.')
+                            selected_kg = f"{s_num} kg"
+
+            return extracted, selected, selected_kg
     except Exception:
         # LLM failed; return empty so selected% remains empty
-        return [], ""
+        return [], "", ""
 
-    return [], ""
+    return [], "", ""
 
 # -------------------- Scoring helpers --------------------
 def compute_a1c_score(selected_pct_str: str):
@@ -501,7 +485,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
-            if 'from-to' in t:
+            if 'from-to' in t and 'relative' not in t:
                 # present as delta (pp)
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
@@ -519,17 +503,17 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             drug_hint = str(row.get(drug_col_name, '') or "")
 
         # HbA1c LLM
-        hba_llm_extracted, hba_selected = ([], "")
+        hba_llm_extracted, hba_selected, _ = ([], "", "")
         if _model is not None and sentence_str:
-            hba_llm_extracted, hba_selected = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
+            hba_llm_extracted, hba_selected, _ = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
 
-        # Weight LLM
-        wt_llm_extracted, wt_selected = ([], "")
+        # Weight LLM (now returns extracted list, selected percent, selected kg)
+        wt_llm_extracted, wt_selected, wt_selected_kg = ([], "", "")
         if _model is not None and weight_sentence_str:
-            wt_llm_extracted, wt_selected = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+            wt_llm_extracted, wt_selected, wt_selected_kg = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
         # ALSO include any kg matches found by the regex (wt_matches) into the LLM extracted list.
-        # This preserves existing percent-based LLM outputs and appends strings like '3.5 kg'.
+        # This preserves percent-based LLM outputs and appends strings like '3.5 kg'.
         def _fmt_kg(v):
             try:
                 fv = float(v)
@@ -545,7 +529,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         for m in wt_matches:
             t = (m.get('type') or '').lower()
             # detect our kg match types (we used ':kg_pmSpaces5' type in extraction)
-            if ':kg' in t:
+            if ':kg' in t or 'kg' in t:
                 vals = m.get('values') or []
                 if vals:
                     # values stored as [numeric, 'kg'] or numeric
@@ -558,10 +542,38 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             wt_llm_extracted = (wt_llm_extracted or []) + kg_values
 
         # If LLM extracted is empty, we must ensure selected remains empty (explicit requirement)
+        # BUT if we found kg via regex, we should treat that as an extracted value and set selected_kg accordingly
         if not hba_llm_extracted:
             hba_selected = ""
         if not wt_llm_extracted:
             wt_selected = ""
+            # keep wt_selected_kg empty for now; we'll set it from kg_values below if present
+            wt_selected_kg = ""
+
+        # If LLM did not return selected_kg but regex kg_values exist, pick the first kg value as selected_kg
+        if (not wt_selected_kg) and kg_values:
+            wt_selected_kg = kg_values[0]
+
+        # If both kg and percent exist, prefer kg:
+        # - If wt_selected_kg exists, convert it to percent using BASELINE_WEIGHT and set wt_selected to that percent.
+        def kg_to_percent(kg_str):
+            """kg_str like '3.5 kg' -> percent string relative to baseline"""
+            if not kg_str:
+                return ""
+            m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', kg_str)
+            if not m:
+                return ""
+            num = parse_number(m.group(1))
+            if math.isnan(num) or BASELINE_WEIGHT == 0:
+                return ""
+            pct = (abs(num) / float(BASELINE_WEIGHT)) * 100.0
+            return fmt_pct(pct)
+
+        # If model returned a selected_kg, prefer it. Otherwise if regex found kg, we already set wt_selected_kg above.
+        if wt_selected_kg:
+            # override percent with kg->percent
+            wt_selected_converted = kg_to_percent(wt_selected_kg)
+            wt_selected = wt_selected_converted
 
         # Ensure selected% is formatted and positive
         def normalize_selected(s):
@@ -577,8 +589,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
         hba_selected = normalize_selected(hba_selected)
         wt_selected  = normalize_selected(wt_selected)
+        # wt_selected_kg already formatted as 'N kg' or empty
 
-        # Scores
+        # Scores - weight score uses the percent value (which may have been converted from kg)
         a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(wt_selected)
 
@@ -593,6 +606,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'weight_extracted_matches': wt_regex_vals,
             'Weight LLM extracted': wt_llm_extracted,
             'Weight selected %': wt_selected,
+            'Weight selected kg': wt_selected_kg,
             'Weight Score': weight_score,
         })
         rows.append(new)
@@ -636,9 +650,16 @@ def insert_after(cols, after, names):
 display_df = out_df.copy()
 cols = list(display_df.columns)
 cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
-cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
+cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight selected kg", "Weight Score"])
 # keep user columns order + these additions
-display_df = display_df[cols]
+# remove duplicates, keep order
+seen = set()
+new_cols = []
+for c in cols:
+    if c not in seen:
+        new_cols.append(c)
+        seen.add(c)
+display_df = display_df[new_cols]
 
 # -------------------- Show results --------------------
 st.write("### Results (first 200 rows shown)")
