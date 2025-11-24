@@ -14,9 +14,6 @@ API_KEY = ""   # <- replace with your real key
 # Baseline weight for converting kg -> percent
 BASELINE_WEIGHT = 105.0  # kg (change if needed)
 
-# Baseline A1c for converting absolute A1c change (percentage points) -> relative %
-BASELINE_A1C = 8.2  # percent (change if needed)
-
 # Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
 try:
@@ -54,6 +51,14 @@ re_reduction_cue = re.compile(
 # units for weight (kg/kilogram)
 re_weight_unit = re.compile(r'\bkg\b|\bkilograms?\b', FLAGS)
 
+# Duration regexes (captures e.g., "12 weeks", "6 months", "52 wk", "12-mo", "1 year", "week 36")
+DUR_MAIN = re.compile(
+    r'(\b\d+(?:[.,·]\d+)?\s*(?:years?|yrs?|y|months?|mos?|mo|weeks?|wks?|wk|days?|d)\b|\b\d+\s*-\s*mo\b|\b\d+\s*mo\b|\b\d+\s*-\s*wk\b)',
+    FLAGS
+)
+# Also capture patterns like "week 36", "week36", "at week 36", "12-mo"
+DUR_ALT = re.compile(r'\b(?:week|wk|month|mo|year|yr|day)s?\b[\s\-]*\d+\b', FLAGS)
+
 # -------------------- Utilities --------------------
 def parse_number(s: str) -> float:
     if s is None:
@@ -90,30 +95,6 @@ def fmt_pct(v):
         return ''
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
-
-# Convert kg -> percent using baseline weight
-def kg_to_percent_raw_val(kg_val):
-    try:
-        if kg_val is None:
-            return None
-        num = float(kg_val)
-    except:
-        return None
-    if BASELINE_WEIGHT == 0:
-        return None
-    return (abs(num) / float(BASELINE_WEIGHT)) * 100.0
-
-# Convert A1c percentage-points (pp) -> relative percent using baseline A1c
-def pp_to_percent_raw(pp_val):
-    try:
-        if pp_val is None:
-            return None
-        num = float(pp_val)
-    except:
-        return None
-    if BASELINE_A1C == 0:
-        return None
-    return (abs(num) / float(BASELINE_A1C)) * 100.0
 
 # --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
@@ -285,6 +266,87 @@ def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
     return filtered, sentences_used
 
+# -------------------- Duration extraction helpers --------------------
+def find_durations_in_sentence(sent: str):
+    """Return list of textual duration matches found in a sentence."""
+    found = []
+    # main numeric + unit patterns
+    for m in DUR_MAIN.finditer(sent):
+        txt = m.group(0).strip()
+        found.append(txt)
+    # alt patterns like "week 36"
+    for m in DUR_ALT.finditer(sent):
+        txt = m.group(0).strip()
+        if txt not in found:
+            found.append(txt)
+    return found
+
+def normalize_duration_to_months(duration_text: str):
+    """
+    Convert a textual duration (e.g., '12 weeks', '6 months', '1 year', '12-mo', 'week 36') -> months (float).
+    Returns months as float or None if cannot parse.
+    """
+    if not duration_text or not isinstance(duration_text, str):
+        return None
+    s = duration_text.lower().replace('.', '').strip()
+    # common separators
+    s = s.replace('-', ' ').replace('_', ' ')
+    # find number
+    num_m = re.search(r'(\d+(?:[.,·]\d+)?)', s)
+    if not num_m:
+        return None
+    num = parse_number(num_m.group(1))
+    if math.isnan(num):
+        return None
+    # unit detection
+    if re.search(r'year|yr|y\b', s):
+        months = num * 12.0
+        return months
+    if re.search(r'month|mo\b|mos\b', s):
+        return num
+    if re.search(r'week|wk|wks\b', s):
+        # approximate convert weeks to months
+        months = num / 4.345
+        return months
+    if re.search(r'day|d\b', s):
+        months = num / 30.0
+        return months
+    # if pattern is 'week36' or 'week 36' treat as weeks -> months
+    if re.search(r'\bweek\s*\d+', s):
+        mnum = num
+        return mnum / 4.345
+    # fallback: if "12-mo" or "12mo"
+    if re.search(r'\bmo\b', s):
+        return num
+    return None
+
+def extract_duration_from_sentences(sentences_list):
+    """
+    Given a list of sentences (that qualified for extraction), find duration mentions and
+    return:
+        - durations_text: joined textual matches (unique, ' | ' separated)
+        - months_norm: numeric months (choose the most relevant — heuristics: prefer longest timepoint)
+    """
+    if not sentences_list:
+        return "", None
+    found = []
+    months_candidates = []
+    for sent in sentences_list:
+        durs = find_durations_in_sentence(sent)
+        for d in durs:
+            if d not in found:
+                found.append(d)
+            m = normalize_duration_to_months(d)
+            if m is not None:
+                months_candidates.append((m, d))
+    durations_text = ' | '.join(found)
+    # Heuristic for selecting a numeric month: prefer the largest (e.g., 12 months over 6 months), else first.
+    months_norm = None
+    if months_candidates:
+        months_candidates.sort(key=lambda x: x[0], reverse=True)
+        months_norm = round(months_candidates[0][0], 2)
+    return durations_text, months_norm
+
 # -------------------- UI --------------------
 st.sidebar.header('Options')
 uploaded   = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
@@ -381,7 +443,7 @@ KEY PRINCIPLES (strict)
 5) Units to return:
    - Percent values: strings with '%' (e.g., "1.75%").
    - Kg values: strings with ' kg' suffix (e.g., "3.64 kg").
-   - Return both types if both are present in the sentence (so the app can decide which to prefer).
+   - Return both types if both are present in the sentence (so the app can decide which to prefer). 
 
 6) Drug context (`DRUG_HINT`):
    - You will be given an optional `DRUG_HINT` string. Use it to disambiguate when multiple drugs/groups are mentioned.
@@ -436,7 +498,6 @@ KEY PRINCIPLES (strict)
 
 15) Confidence (optional):
    - If you can compute a meaningful confidence (0–1) that the returned selected_* is correct, you may include `"confidence": <float>`.
-
 That is all. RETURN ONLY THE JSON OBJECT (no commentary).
 """
 
@@ -730,113 +791,8 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
         final_wt_selected_pct = normalize_selected(final_wt_selected_pct)
 
-        # ---------------------------
-        # NEW: Handle A1c similar to weight:
-        # - convert A1c absolute changes (pp) -> relative percent using BASELINE_A1C for ranking/selection
-        # - return selected A1c as percentage-points (unchanged) but choose the A1c that ranks highest by relative percent when needed
-        # ---------------------------
-
-        # Build hba candidates with relative percent conversion (relative to BASELINE_A1C)
-        hba_candidates = []  # list of tuples (pp_num, pct_str_pp, sentence_index, raw_type, rel_pct)
-        for hm in hba_matches:
-            si = hm.get('sentence_index')
-            t = (hm.get('type') or '').lower()
-            vals = hm.get('values') or []
-            num = None
-            # if explicit from-to relative percent present in regex matches (rare for A1c) use that
-            if 'from-to_relative_percent' in t and len(vals) >= 3:
-                try:
-                    num = float(vals[2])
-                except:
-                    num = None
-            elif 'from-to' in t and hm.get('reduction_pp') is not None:
-                # reduction_pp is absolute pp (X - Y)
-                try:
-                    num = float(hm.get('reduction_pp'))
-                except:
-                    num = None
-            elif vals:
-                try:
-                    # assume values[0] holds the numeric pp
-                    num = float(vals[0])
-                except:
-                    num = None
-            if num is not None and not math.isnan(num):
-                pct_str = fmt_pct(num)  # keep as pp string
-                rel = pp_to_percent_raw(num)
-                hba_candidates.append((float(num), pct_str, si, t, rel))
-
-        # Decide hba_selected:
-        # Rule: If there exists any hba_candidate that is in a sentence which has associated weight info,
-        # pick the hba candidate that belongs to the sentence with the highest weight percent.
-        # (This logic unchanged: we map weight matches to sentences and find highest per sentence.)
-        sentence_weight_pct = {}  # sentence_index -> max weight percent numeric
-        for wm in wt_matches:
-            si = wm.get('sentence_index')
-            p = None
-            t = (wm.get('type') or '').lower()
-            vals = wm.get('values') or []
-            if 'from-to_relative_percent' in t and len(vals) >= 3:
-                try:
-                    p = float(vals[2])
-                except:
-                    p = None
-            elif 'percent' in t or 'pp' in t or 'range_percent' in t:
-                if vals and isinstance(vals[0], (int, float)):
-                    try:
-                        p = float(vals[0])
-                    except:
-                        p = None
-            elif 'kg' in t and vals:
-                try:
-                    kgv = float(vals[0])
-                    p = kg_to_percent_raw_val(kgv)
-                except:
-                    p = None
-            if p is not None:
-                if si not in sentence_weight_pct or (p is not None and p > sentence_weight_pct[si]):
-                    sentence_weight_pct[si] = p
-
-        hba_selected_final = ""  # percent string (pp)
-        hba_source = ""
-
-        if hba_candidates and sentence_weight_pct:
-            # build mapping sentence -> list of hba candidates in that sentence
-            si_to_hba = {}
-            for (num, pct_str, si, t, rel) in hba_candidates:
-                si_to_hba.setdefault(si, []).append((num, pct_str, rel, t))
-            # find best sentence among those that have weight pct
-            candidate_sentences = []
-            for si, hlist in si_to_hba.items():
-                if si in sentence_weight_pct:
-                    candidate_sentences.append((sentence_weight_pct[si], si, hlist))
-            if candidate_sentences:
-                # pick sentence with highest weight percent
-                candidate_sentences.sort(key=lambda x: x[0], reverse=True)
-                best_sentence_weight_pct, best_si, hlist = candidate_sentences[0]
-                # within that sentence, pick the best hba candidate (choose the largest RELATIVE percent if available, otherwise largest pp)
-                hlist.sort(key=lambda x: (x[2] if x[2] is not None else x[0]), reverse=True)
-                chosen = hlist[0]
-                hba_selected_final = chosen[1]  # pp string
-                hba_source = f"assoc_weight_sentence_{best_si}"
-
-        # If not found via associated weight, fall back to LLM selected or highest hba candidate overall (rank by relative percent)
-        if not hba_selected_final:
-            if hba_selected:
-                hba_selected_final = _norm_percent(hba_selected)
-                hba_source = "llm_selected"
-            else:
-                if hba_candidates:
-                    # sort by relative percent (if available) else by raw pp
-                    hba_candidates.sort(key=lambda x: (x[4] if x[4] is not None else x[0]), reverse=True)
-                    hba_selected_final = hba_candidates[0][1]
-                    hba_source = "regex_highest_by_rel_or_pp"
-                else:
-                    hba_selected_final = ""
-                    hba_source = "none"
-
-        # Normalize and ensure formatting for hba_selected_final (keep as pp because scoring expects pp)
-        def normalize_selected_pct_str(s):
+        # Normalize hba selected
+        def normalize_selected_hba(s):
             if not s:
                 return ""
             s2 = s.replace('%', '').replace(',', '.').strip()
@@ -846,25 +802,32 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
                 return fmt_pct(v)
             except:
                 return ""
-
-        hba_selected_final = normalize_selected_pct_str(hba_selected_final)
+        hba_selected = normalize_selected_hba(hba_selected)
 
         # Scores
-        a1c_score = compute_a1c_score(hba_selected_final)
+        a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(final_wt_selected_pct)
+
+        # --- Duration extraction for HbA1c and Weight (from qualifying sentences) ---
+        a1c_duration_text, a1c_duration_months = extract_duration_from_sentences(hba_sentences)
+        wt_duration_text, wt_duration_months = extract_duration_from_sentences(wt_sentences)
 
         new = row.to_dict()
         new.update({
             'sentence': sentence_str,
             'extracted_matches': hba_regex_vals,
             'LLM extracted': hba_llm_extracted,
-            'selected %': hba_selected_final,
+            'selected %': hba_selected,
             'A1c Score': a1c_score,
+            'A1c duration': a1c_duration_text,
+            'A1c duration months': a1c_duration_months,
             'weight_sentence': weight_sentence_str,
             'weight_extracted_matches': wt_regex_vals,
             'Weight LLM extracted': wt_llm_extracted,
             'Weight selected %': final_wt_selected_pct,
             'Weight Score': weight_score,
+            'Weight duration': wt_duration_text,
+            'Weight duration months': wt_duration_months,
         })
         rows.append(new)
 
@@ -906,8 +869,8 @@ def insert_after(cols, after, names):
 
 display_df = out_df.copy()
 cols = list(display_df.columns)
-cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
-cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
+cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score", "A1c duration", "A1c duration months"])
+cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score", "Weight duration", "Weight duration months"])
 # keep user columns order + these additions
 # remove duplicates and keep order
 seen = set()
