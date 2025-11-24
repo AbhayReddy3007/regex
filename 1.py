@@ -528,6 +528,35 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
+        # ALSO include any kg matches found by the regex (wt_matches) into the LLM extracted list.
+        # This preserves existing percent-based LLM outputs and appends strings like '3.5 kg'.
+        def _fmt_kg(v):
+            try:
+                fv = float(v)
+            except:
+                try:
+                    fv = parse_number(v)
+                except:
+                    return None
+            s = f"{fv:.3f}".rstrip('0').rstrip('.')
+            return f"{s} kg"
+
+        kg_values = []
+        for m in wt_matches:
+            t = (m.get('type') or '').lower()
+            # detect our kg match types (we used ':kg_pmSpaces5' type in extraction)
+            if ':kg' in t:
+                vals = m.get('values') or []
+                if vals:
+                    # values stored as [numeric, 'kg'] or numeric
+                    v = vals[0]
+                    kg_str = _fmt_kg(v)
+                    if kg_str:
+                        kg_values.append(kg_str)
+
+        if kg_values:
+            wt_llm_extracted = (wt_llm_extracted or []) + kg_values
+
         # If LLM extracted is empty, we must ensure selected remains empty (explicit requirement)
         if not hba_llm_extracted:
             hba_selected = ""
