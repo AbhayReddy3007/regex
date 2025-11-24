@@ -14,9 +14,6 @@ API_KEY = ""   # <- replace with your real key
 # Baseline weight for converting kg -> percent
 BASELINE_WEIGHT = 105.0  # kg (change if needed)
 
-# Baseline A1c for converting absolute A1c change (percentage points) -> relative %
-BASELINE_A1C = 8.2  # percent (change if needed)
-
 # Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
 try:
@@ -137,12 +134,12 @@ def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: in
 
 def add_match(out, si, abs_start, m, typ, values, reduction):
     out.append({
-        'raw': m.group(0),
+        'raw': m.group(0) if hasattr(m, 'group') else str(m),
         'type': typ,
         'values': values,
         'reduction_pp': reduction,
         'sentence_index': si,
-        'span': (abs_start + m.start(), abs_start + m.end()),
+        'span': (abs_start + (m.start() if hasattr(m, 'start') else 0), abs_start + (m.end() if hasattr(m, 'end') else 0)),
     })
 
 # -------------------- Core extraction --------------------
@@ -159,19 +156,25 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp) AND relative %
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
-        red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
-        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
-        # ALSO compute relative reduction % = ((a - b) / a) * 100  (if a != 0)
+        red_pp = None if (math.isnan(a) or math.isnan(b)) else (a - b)
+        # compute relative reduction percent if possible
+        rel = None
         if not (math.isnan(a) or math.isnan(b)) and a != 0:
             rel = ((a - b) / a) * 100.0
+        # add the absolute-from-to match (keep for completeness)
+        add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red_pp)
+        # ALSO compute relative reduction % = ((a - b) / a) * 100  (if a != 0)
+        if rel is not None:
+            # Create a synthetic match object-like entry but with correct span
             rel_raw = f"{rel:.3f}%"
+            # We'll append a proper dict directly so other code can consume it
             matches.append({
                 'raw': rel_raw,
                 'type': f'{tag_prefix}:from-to_relative_percent',
                 'values': [a, b, rel],
-                'reduction_pp': red,
+                'reduction_pp': red_pp,
                 'sentence_index': si,
-                'span': (0, 0),
+                'span': (m.start(), m.end()),
             })
 
     # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
@@ -357,7 +360,7 @@ KEY PRINCIPLES (strict)
 5) Units to return:
    - Percent values: strings with '%' (e.g., "1.75%").
    - Kg values: strings with ' kg' suffix (e.g., "3.64 kg").
-   - Return both types if both are present in the sentence (so the app can decide which to prefer).
+   - Return both types if both are present in the sentence (so the app can decide which to prefer). 
 
 6) Drug context (`DRUG_HINT`):
    - You will be given an optional `DRUG_HINT` string. Use it to disambiguate when multiple drugs/groups are mentioned.
@@ -412,8 +415,6 @@ KEY PRINCIPLES (strict)
 
 15) Confidence (optional):
    - If you can compute a meaningful confidence (0–1) that the returned selected_* is correct, you may include `"confidence": <float>`.
-
-That is all. RETURN ONLY THE JSON OBJECT (no commentary).
 """
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
@@ -560,9 +561,34 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
-            if 'from-to' in t and 'relative' not in t:
+            # If this is a from-to match, prefer the relative percent if available in the same span
+            if 'from-to' in t:
+                # If this particular match is the relative match, return its value
+                if 'relative' in t:
+                    # relative stored in values[2] if present
+                    vals = m.get('values') or []
+                    if len(vals) >= 3 and vals[2] is not None and not math.isnan(vals[2]):
+                        return fmt_pct(vals[2])
+                    # fallback to reduction_pp if relative missing
+                    if m.get('reduction_pp') is not None and not math.isnan(m.get('reduction_pp')):
+                        return fmt_pct(m.get('reduction_pp'))
+                    return m.get('raw', '')
+                else:
+                    # For the absolute from-to entry: try to find a sibling relative entry (same span) first
+                    # (we rely on the fact that extract_in_sentence appends a sibling relative match with same span)
+                    # if no relative available, return reduction_pp (absolute pp)
+                    vals = m.get('values') or []
+                    # attempt to find relative in the results set by looking ahead (not possible here), so fallback:
+                    if m.get('reduction_pp') is not None and not math.isnan(m.get('reduction_pp')):
+                        # still format absolute as percent-points if no relative
+                        return fmt_pct(m.get('reduction_pp'))
+                    return m.get('raw', '')
+            # otherwise other types: return the raw or normalized representation
+            raw = m.get('raw', '')
+            # If match already is a percent-like numeric in reduction_pp, format it
+            if isinstance(m.get('reduction_pp'), (int, float)) and not math.isnan(m.get('reduction_pp')):
                 return fmt_pct(m.get('reduction_pp'))
-            return m.get('raw', '')
+            return raw
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
         wt_regex_vals  = [fmt_extracted(m) for m in wt_matches]
@@ -706,130 +732,18 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
         final_wt_selected_pct = normalize_selected(final_wt_selected_pct)
 
-        # ---------------------------
-        # A1c: build candidates and pick highest relative percent (mirror weight behavior)
-        # ---------------------------
-        def pp_to_percent_raw(pp_val):
-            """Convert A1c absolute pp -> relative percent of baseline A1c."""
-            try:
-                if pp_val is None:
-                    return None
-                num = float(pp_val)
-            except:
-                return None
-            if BASELINE_A1C == 0:
-                return None
-            return (abs(num) / float(BASELINE_A1C)) * 100.0
-
-        # collect A1c candidates from regex matches (hba_matches) — these are absolute percentage-points (pp)
-        hba_candidates = []  # list of tuples (pp_value, pp_str, sentence_index, type, rel_percent)
-        for hm in hba_matches:
-            si = hm.get('sentence_index')
-            t = (hm.get('type') or '').lower()
-            vals = hm.get('values') or []
-            num = None
-            # if regex produced a from-to relative percent (values[2]) we accept it as a relative candidate
-            if 'from-to_relative_percent' in t and len(vals) >= 3:
-                try:
-                    rel = float(vals[2])
-                    # store as (None, '', si, t, rel) so it can be considered by rel-ranking
-                    hba_candidates.append((None, "", si, t, rel))
-                    continue
-                except:
-                    pass
-            # absolute pp from reduction_pp or values[0]
-            if hm.get('reduction_pp') is not None:
-                try:
-                    num = float(hm.get('reduction_pp'))
-                except:
-                    num = None
-            elif vals:
-                try:
-                    num = float(vals[0])
-                except:
-                    num = None
-            if num is not None and not math.isnan(num):
-                rel = pp_to_percent_raw(num)
-                pp_str = fmt_pct(num)
-                hba_candidates.append((float(num), pp_str, si, t, rel))
-
-        # include LLM-extracted A1c percents (usually pp like "1.75%")
-        for item in (hba_llm_extracted or []):
-            if isinstance(item, str) and item.strip().endswith('%'):
-                try:
-                    n = float(item.strip().replace('%', '').replace(',', '.'))
-                    rel = pp_to_percent_raw(n)
-                    hba_candidates.append((n, fmt_pct(n), None, 'llm', rel))
-                except:
-                    pass
-
-        # include LLM-selected pp fallback if provided
-        if hba_selected:
-            try:
-                n = float(hba_selected.replace('%','').replace(',','.'))
-                rel = pp_to_percent_raw(n)
-                hba_candidates.append((n, fmt_pct(n), None, 'llm_selected', rel))
-            except:
-                pass
-
-        # pick the best A1c by highest relative percent (if available)
-        best_hba_rel = None
-        best_hba_pp_str = ""
-        best_hba_pp_val = None
-        # prefer entries that have rel value
-        rel_entries = [c for c in hba_candidates if c[4] is not None]
-        if rel_entries:
-            rel_entries.sort(key=lambda x: x[4], reverse=True)
-            chosen = rel_entries[0]
-            best_hba_rel = chosen[4]
-            best_hba_pp_val = chosen[0]
-            best_hba_pp_str = chosen[1] or ""
-        else:
-            # fallback: if LLM selected exists use it; else largest pp
-            if hba_selected:
-                try:
-                    n = float(hba_selected.replace('%','').replace(',','.'))
-                    best_hba_pp_val = n
-                    best_hba_pp_str = fmt_pct(n)
-                    best_hba_rel = pp_to_percent_raw(n)
-                except:
-                    pass
-            elif hba_candidates:
-                # pick largest pp
-                pp_entries = [c for c in hba_candidates if c[0] is not None]
-                if pp_entries:
-                    pp_entries.sort(key=lambda x: x[0], reverse=True)
-                    chosen = pp_entries[0]
-                    best_hba_pp_val = chosen[0]
-                    best_hba_pp_str = chosen[1]
-                    best_hba_rel = chosen[4]
-
-        # normalize and format outputs
-        def normalize_selected_pct_str(s):
+        # Normalize hba selected
+        def normalize_selected_hba(s):
             if not s:
                 return ""
-            s2 = s.replace('%','').replace(',','.').strip()
+            s2 = s.replace('%', '').replace(',', '.').strip()
             try:
                 v = float(s2)
                 v = abs(v)
                 return fmt_pct(v)
             except:
                 return ""
-
-        selected_hba_pp = ""
-        selected_hba_rel_pct = ""
-        if best_hba_pp_val is not None:
-            selected_hba_pp = fmt_pct(best_hba_pp_val)
-        if best_hba_rel is not None:
-            selected_hba_rel_pct = fmt_pct(best_hba_rel)
-
-        # fallback: if nothing found keep existing hba_selected value (already normalized earlier)
-        if not (hba_candidates or hba_llm_extracted):
-            selected_hba_pp = hba_selected or ""
-            selected_hba_rel_pct = ""
-
-        # set hba_selected to the pp (so existing scoring works)
-        hba_selected = normalize_selected_pct_str(selected_hba_pp)
+        hba_selected = normalize_selected_hba(hba_selected)
 
         # Scores
         a1c_score = compute_a1c_score(hba_selected)
@@ -840,9 +754,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'sentence': sentence_str,
             'extracted_matches': hba_regex_vals,
             'LLM extracted': hba_llm_extracted,
-            'selected %': hba_selected,                      # A1c selected in pp for scoring
-            'A1c selected pp': selected_hba_pp,              # explicit pp selected (human-readable)
-            'A1c selected % (relative)': selected_hba_rel_pct,# relative percent vs BASELINE_A1C
+            'selected %': hba_selected,
             'A1c Score': a1c_score,
             'weight_sentence': weight_sentence_str,
             'weight_extracted_matches': wt_regex_vals,
@@ -890,7 +802,7 @@ def insert_after(cols, after, names):
 
 display_df = out_df.copy()
 cols = list(display_df.columns)
-cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c selected pp", "A1c selected % (relative)", "A1c Score"])
+cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
 cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
 # keep user columns order + these additions
 # remove duplicates and keep order
