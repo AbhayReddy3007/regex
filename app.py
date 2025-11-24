@@ -83,9 +83,10 @@ def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
     return has_term and has_pct and has_cue
 
 def fmt_pct(v):
+    """Format percent with 2 decimal places (strip trailing zeros if any)."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return ''
-    s = f"{float(v):.3f}".rstrip('0').rstrip('.')
+    s = f"{float(v):.2f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
 # --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
@@ -165,7 +166,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red_pp)
         # ALSO compute relative reduction % = ((a - b) / b) * 100  (if b != 0)
         if rel is not None:
-            rel_raw = f"{rel:.3f}%"
+            rel_raw = f"{rel:.6f}%"  # keep higher precision here; formatting is applied later
             matches.append({
                 'raw': rel_raw,
                 'type': f'{tag_prefix}:from-to_relative_percent',
@@ -560,6 +561,31 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c')
         wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight')
 
+        # ------------------ compute precomputed relative values (from regex) ------------------
+        def _find_relative_fromto(matches):
+            # prefer explicit relative match
+            for m in matches:
+                t = (m.get('type') or '').lower()
+                if 'from-to_relative_percent' in t:
+                    vals = m.get('values') or []
+                    if len(vals) >= 3 and vals[2] is not None and not math.isnan(vals[2]):
+                        return fmt_pct(vals[2])
+            # fallback: compute from absolute from-to match if available using ((a - b)/b)*100
+            for m in matches:
+                t = (m.get('type') or '').lower()
+                if 'from-to_sentence' in t:
+                    vals = m.get('values') or []
+                    if len(vals) >= 2:
+                        a = vals[0]; b = vals[1]
+                        if not (math.isnan(a) or math.isnan(b)) and b != 0:
+                            rel = ((a - b) / b) * 100.0
+                            return fmt_pct(rel)
+            return None
+
+        precomputed_hba_rel = _find_relative_fromto(hba_matches)
+        precomputed_wt_rel  = _find_relative_fromto(wt_matches)
+        # -------------------------------------------------------------------------------
+
         # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
@@ -603,6 +629,22 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         wt_llm_extracted, wt_selected, wt_selected_fallback = ([], "", "")
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected, wt_selected_fallback = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+
+        # --- FORCE precomputed relative into LLM outputs if LLM didn't pick one ---
+        # For HbA1c: prefer precomputed relative (if present)
+        if precomputed_hba_rel:
+            if precomputed_hba_rel not in (hba_llm_extracted or []):
+                hba_llm_extracted = ([precomputed_hba_rel] if not hba_llm_extracted else [precomputed_hba_rel] + hba_llm_extracted)
+            if not hba_selected:
+                hba_selected = precomputed_hba_rel
+
+        # For Weight: do similarly but careful to prefer LLM percent candidates if present
+        if precomputed_wt_rel:
+            if precomputed_wt_rel not in (wt_llm_extracted or []):
+                wt_llm_extracted = ([precomputed_wt_rel] if not wt_llm_extracted else [precomputed_wt_rel] + wt_llm_extracted)
+            if not wt_selected:
+                wt_selected = precomputed_wt_rel
+        # ----------------------------------------------------------------
 
         # ALSO include any kg matches found by the regex into the weight LLM extracted list (but NOT into HbA1c)
         def _fmt_kg(v):
