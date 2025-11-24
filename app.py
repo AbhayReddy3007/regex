@@ -153,21 +153,19 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp) AND relative %
+    # 1) WHOLE-SENTENCE: from X% to Y%  -> absolute pp AND relative % using ((X - Y) / Y) * 100 per request
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
         red_pp = None if (math.isnan(a) or math.isnan(b)) else (a - b)
-        # compute relative reduction percent if possible
+        # compute relative reduction percent using ((a - b) / b) * 100 if possible (guard b != 0)
         rel = None
-        if not (math.isnan(a) or math.isnan(b)) and a != 0:
-            rel = ((a - b) / a) * 100.0
+        if not (math.isnan(a) or math.isnan(b)) and b != 0:
+            rel = ((a - b) / b) * 100.0
         # add the absolute-from-to match (keep for completeness)
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red_pp)
-        # ALSO compute relative reduction % = ((a - b) / a) * 100  (if a != 0)
+        # ALSO compute relative reduction % = ((a - b) / b) * 100  (if b != 0)
         if rel is not None:
-            # Create a synthetic match object-like entry but with correct span
             rel_raw = f"{rel:.3f}%"
-            # We'll append a proper dict directly so other code can consume it
             matches.append({
                 'raw': rel_raw,
                 'type': f'{tag_prefix}:from-to_relative_percent',
@@ -329,7 +327,7 @@ Return one JSON object. Allowed keys (you may include some or all as appropriate
 {
   "extracted": ["1.23%", "3.5 kg", "25.0% (relative)"],     // REQUIRED (array; may be empty). Include all plausible candidates you find in the sentence.
   "selected_percent": "1.23%",                              // OPTIONAL: best percent value (absolute or relative) — positive magnitude, trailing '%'
-  "selected_relative_percent": "25.0%",                     // OPTIONAL: the relative % computed from a `from X% to Y%` phrase ((X - Y) / X * 100)
+  "selected_relative_percent": "25.0%",                     // OPTIONAL: the relative % computed from a `from X% to Y%` phrase ((X - Y) / Y * 100)
   "selected_kg": "3.5 kg",                                  // OPTIONAL: best kg value (absolute, positive, suffix ' kg')
   "confidence": 0.92                                         // OPTIONAL: number 0.0–1.0 indicating your confidence (only if available)
 }
@@ -352,15 +350,14 @@ KEY PRINCIPLES (strict)
 4) `from X% to Y%` handling (absolute and relative):
    - When you detect a `from X% to Y%` pattern (or wording like "declined from X% to Y%"):
      a) Compute ABSOLUTE change in percentage points: `abs_pp = X - Y`.
-        - You may include this absolute pp (e.g., "2.00%") in `extracted` if clearly reported.
-     b) Compute RELATIVE reduction % = `((X - Y) / X) * 100`.
-        - Include the relative percent in `extracted` (optionally append " (relative)" for readability) and set `selected_relative_percent` to the normalized percent string (e.g., "25.0%") if the relative value is the best representative percent for the sentence.
+     b) Compute RELATIVE reduction % using the formula: `((X - Y) / Y) * 100`.
+        - Format as "N.N%" (dot decimal), round reasonably, include in `extracted` and set `selected_relative_percent` to this value if appropriate.
    - Normalization: compute numerically, round to sensible precision (2–3 decimals ok), and format as "N.N%".
 
 5) Units to return:
    - Percent values: strings with '%' (e.g., "1.75%").
    - Kg values: strings with ' kg' suffix (e.g., "3.64 kg").
-   - Return both types if both are present in the sentence (so the app can decide which to prefer). 
+   - Return both types if both are present in the sentence (so the app can decide which to prefer).
 
 6) Drug context (`DRUG_HINT`):
    - You will be given an optional `DRUG_HINT` string. Use it to disambiguate when multiple drugs/groups are mentioned.
@@ -403,7 +400,7 @@ KEY PRINCIPLES (strict)
        -> extracted should include "1.75%" and "3.64 kg"; selected_percent "1.75%" and selected_kg "3.64 kg" (if asked to pick both). If the app prefers percent, selected_percent must be set and used.
    - Example C:
        Sentence: "Declined from 8.0% to 6.0%."
-       -> absolute change = 2.0 pp; relative reduction = ((8 - 6)/8)*100 = 25.0%. Include "25.0% (relative)" in extracted and set selected_relative_percent "25.0%" if that relative value is the best representative percent for the sentence.
+       -> absolute change = 2.0 pp; relative reduction = ((8 - 6)/6)*100 = 33.333...%. Include "33.333% (relative)" in extracted and set selected_relative_percent "33.33%" if that relative value is the best representative percent for the sentence.
    - Example D:
        Sentence: "Mean reduction: 3,5 kg (p<0.01)."
        -> extracted should include "3.5 kg". Do NOT include "p<0.01" or anything related to p-value.
@@ -441,11 +438,15 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if s != -1 and e > s:
             data = json.loads(text[s:e+1])
             extracted = []
+            is_hba_target = str(target_label).strip().lower().startswith('hb')
             for x in (data.get("extracted") or []):
                 if not isinstance(x, str):
                     continue
                 x = x.strip()
-                # kg values
+                # If target is HbA1c, ignore any kg items (do not extract kg for A1c)
+                if is_hba_target and re.search(r'\bkg\b', x, re.IGNORECASE):
+                    continue
+                # kg values (allowed for weight target)
                 if re.search(r'\bkg\b', x, re.IGNORECASE):
                     m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', x)
                     if m:
@@ -453,14 +454,15 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                         if not math.isnan(num):
                             s_num = f"{num:.3f}".rstrip('0').rstrip('.')
                             extracted.append(f"{s_num} kg")
-                else:
-                    # percent
-                    x2 = _norm_percent(x)
-                    if re.search(r'[<>≥≤]', x2):
-                        continue
-                    if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
-                        extracted.append(x2)
-
+                    continue
+                # percent
+                x2 = _norm_percent(x)
+                if re.search(r'[<>≥≤]', x2):
+                    continue
+                if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
+                    # Normalise percent and keep sign stripped for extracted (we keep candidate as-is)
+                    extracted.append(_norm_percent(x2))
+            # selected_percent if present
             selected = _norm_percent(data.get("selected_percent", "") or "")
             if selected:
                 try:
@@ -561,34 +563,24 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
-            # If this is a from-to match, prefer the relative percent if available in the same span
+            # Prefer relative from-to percent if present
             if 'from-to' in t:
-                # If this particular match is the relative match, return its value
                 if 'relative' in t:
-                    # relative stored in values[2] if present
                     vals = m.get('values') or []
                     if len(vals) >= 3 and vals[2] is not None and not math.isnan(vals[2]):
                         return fmt_pct(vals[2])
-                    # fallback to reduction_pp if relative missing
                     if m.get('reduction_pp') is not None and not math.isnan(m.get('reduction_pp')):
                         return fmt_pct(m.get('reduction_pp'))
                     return m.get('raw', '')
                 else:
-                    # For the absolute from-to entry: try to find a sibling relative entry (same span) first
-                    # (we rely on the fact that extract_in_sentence appends a sibling relative match with same span)
-                    # if no relative available, return reduction_pp (absolute pp)
-                    vals = m.get('values') or []
-                    # attempt to find relative in the results set by looking ahead (not possible here), so fallback:
+                    # absolute from-to entry: try to return reduction_pp if available (but relative preferred)
                     if m.get('reduction_pp') is not None and not math.isnan(m.get('reduction_pp')):
-                        # still format absolute as percent-points if no relative
                         return fmt_pct(m.get('reduction_pp'))
                     return m.get('raw', '')
-            # otherwise other types: return the raw or normalized representation
-            raw = m.get('raw', '')
-            # If match already is a percent-like numeric in reduction_pp, format it
+            # other types
             if isinstance(m.get('reduction_pp'), (int, float)) and not math.isnan(m.get('reduction_pp')):
                 return fmt_pct(m.get('reduction_pp'))
-            return raw
+            return m.get('raw', '')
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
         wt_regex_vals  = [fmt_extracted(m) for m in wt_matches]
@@ -612,7 +604,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if _model is not None and weight_sentence_str:
             wt_llm_extracted, wt_selected, wt_selected_fallback = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
-        # ALSO include any kg matches found by the regex (wt_matches) into the LLM extracted list.
+        # ALSO include any kg matches found by the regex into the weight LLM extracted list (but NOT into HbA1c)
         def _fmt_kg(v):
             try:
                 fv = float(v)
@@ -635,6 +627,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
                     if kg_str:
                         kg_values.append(kg_str)
 
+        # ONLY attach kg_values to weight LLM extracted (do NOT attach kg to HbA1c LLM extracted)
         if kg_values:
             wt_llm_extracted = (wt_llm_extracted or []) + kg_values
 
