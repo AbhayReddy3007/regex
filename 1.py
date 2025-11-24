@@ -1,4 +1,3 @@
-# streamlit_hba1c_weight_llm.py
 import re
 import math
 import json
@@ -45,6 +44,8 @@ re_reduction_cue = re.compile(
     r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b',
     FLAGS
 )
+# New: units for weight (kg/kilogram)
+re_weight_unit = re.compile(r'\bkg\b|\bkilograms?\b', FLAGS)
 
 # -------------------- Utilities --------------------
 def parse_number(s: str) -> float:
@@ -67,8 +68,17 @@ def split_sentences(text: str):
     return [p.strip() for p in parts if p and p.strip()]
 
 def sentence_meets_criterion(sent: str, term_re: re.Pattern) -> bool:
-    """Require: (target term) AND a % AND a reduction cue."""
-    return bool(term_re.search(sent)) and bool(re_pct.search(sent)) and bool(re_reduction_cue.search(sent))
+    """Require: (target term) AND a % (or kg for weight) AND a reduction cue."""
+    has_term = bool(term_re.search(sent))
+    has_pct = bool(re_pct.search(sent))
+    has_kg = bool(re_weight_unit.search(sent))
+    has_cue = bool(re_reduction_cue.search(sent))
+
+    # If target is weight, allow either percent OR kg as unit for extraction
+    if term_re == re_weight:
+        return has_term and (has_pct or has_kg) and has_cue
+    # otherwise (e.g., HbA1c) require a percent
+    return has_term and has_pct and has_cue
 
 def fmt_pct(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -183,6 +193,15 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
             v = parse_number(m.group(1))
             add_match(matches, si, abs_s, m, f'{tag_prefix}:percent_pmSpaces5', [v], v)
 
+        # NEW: if weight tag, also look for kg values in the window
+        if tag_prefix == 'weight':
+            for m in re.finditer(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:kg|kilograms?)', seg, FLAGS):
+                any_window_hit = True
+                v = parse_number(m.group(1))
+                # store kg as raw value (e.g., '3.5 kg') — reduction_pp field will hold the numeric kg
+                # we keep 'values' as [v, 'kg'] to indicate unit
+                add_match(matches, si, abs_s, m, f'{tag_prefix}:kg_pmSpaces5', [v, 'kg'], v)
+
     # 3) Weight safety: nearest previous % within 60 chars if no window hit
     if (tag_prefix == 'weight') and (not any_window_hit):
         for hh in term_re.finditer(sent):
@@ -208,6 +227,7 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
         uniq.append(mm)
     uniq.sort(key=lambda x: x['span'][0])
     return uniq
+
 
 def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str):
     """Return (matches, sentences_used) for sentences meeting the criterion."""
@@ -304,8 +324,8 @@ GENERAL PRINCIPLES
 
 2. Only extract *change percentages* (reductions or increases) relevant to the TARGET:
    - Accept formats like "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "from 8.5% to 7.5%" (see computation rule below).
-   - **Ignore** statistics that are not change values: standard errors (SE), p-values, CIs, prevalence/threshold statements (e.g., "≥5%", "HbA1c < 7.0%"), proportions (e.g., "proportion achieving ≥5%"), and labels such as "SE 0.90" or "(p<0.001)".
-   - If a percentage is clearly a threshold, target, or eligibility cutoff (e.g., "HbA1c < 7.0%", "weight loss ≥5%"), do NOT treat it as a reduction — do not include it.
+   - **Ignore** statistics that are not change values: standard errors (SE), p-values, CIs, prevalence/threshold statements (e.g., ">=5%", "HbA1c < 7.0%"), proportions (e.g., "proportion achieving >=5%"), and labels such as "SE 0.90" or "(p<0.001)".
+   - If a percentage is clearly a threshold, target, or eligibility cutoff (e.g., "HbA1c < 7.0%", "weight loss >=5%"), do NOT treat it as a reduction — do not include it.
 
 3. "from X% to Y%" / "declined from X% to Y%" / "improved from X% to Y%":
    - Compute and return the difference as (X - Y) percentage points.
