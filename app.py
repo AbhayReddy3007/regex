@@ -1,3 +1,4 @@
+# streamlit_hba1c_weight_llm.py
 import re
 import math
 import json
@@ -9,6 +10,12 @@ import streamlit as st
 # ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
 API_KEY = ""   # <- replace with your real key
 # =========================================================================
+
+# Baseline weight for converting kg -> percent
+BASELINE_WEIGHT = 105.0  # kg (change if needed)
+
+# Baseline A1c for converting absolute A1c change (percentage points) -> relative %
+BASELINE_A1C = 8.2  # percent (change if needed)
 
 # Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
@@ -44,7 +51,7 @@ re_reduction_cue = re.compile(
     r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b',
     FLAGS
 )
-# New: units for weight (kg/kilogram)
+# units for weight (kg/kilogram)
 re_weight_unit = re.compile(r'\bkg\b|\bkilograms?\b', FLAGS)
 
 # -------------------- Utilities --------------------
@@ -61,9 +68,7 @@ def split_sentences(text: str):
     """Conservative sentence splitter on ., ?, ! or newlines."""
     if not isinstance(text, str):
         return []
-    # keep newlines as sentence boundaries too
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # split on punctuation followed by space/newline
     parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
     return [p.strip() for p in parts if p and p.strip()]
 
@@ -86,14 +91,32 @@ def fmt_pct(v):
     s = f"{float(v):.3f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
+# Convert kg -> percent using baseline weight
+def kg_to_percent_raw_val(kg_val):
+    try:
+        if kg_val is None:
+            return None
+        num = float(kg_val)
+    except:
+        return None
+    if BASELINE_WEIGHT == 0:
+        return None
+    return (abs(num) / float(BASELINE_WEIGHT)) * 100.0
+
+# Convert A1c percentage-points (pp) -> relative percent using baseline A1c
+def pp_to_percent_raw(pp_val):
+    try:
+        if pp_val is None:
+            return None
+        num = float(pp_val)
+    except:
+        return None
+    if BASELINE_A1C == 0:
+        return None
+    return (abs(num) / float(BASELINE_A1C)) * 100.0
+
 # --- build a local window by counting spaces (and INCLUDE bordering tokens) ---
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
-    """
-    Return (segment, abs_start, abs_end) around index 'pos' spanning up to:
-      - PREVIOUS n_prev_spaces whitespace *boundaries* (treat runs of whitespace as one),
-      - NEXT n_next_spaces whitespace boundaries to the right,
-      - includes bordering tokens fully.
-    """
     space_like = set([' ', '\t', '\n', '\r'])
     L = len(s)
 
@@ -157,11 +180,23 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     """
     matches = []
 
-    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp)
+    # 1) WHOLE-SENTENCE: from X% to Y%  -> X - Y (pp) AND relative %
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
         red = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         add_match(matches, si, 0, m, f'{tag_prefix}:from-to_sentence', [a, b], red)
+        # ALSO compute relative reduction % = ((a - b) / a) * 100  (if a != 0)
+        if not (math.isnan(a) or math.isnan(b)) and a != 0:
+            rel = ((a - b) / a) * 100.0
+            rel_raw = f"{rel:.3f}%"
+            matches.append({
+                'raw': rel_raw,
+                'type': f'{tag_prefix}:from-to_relative_percent',
+                'values': [a, b, rel],
+                'reduction_pp': red,
+                'sentence_index': si,
+                'span': (0, 0),
+            })
 
     # 2) ±5-SPACES window (inclusive) around each target term: other patterns only
     any_window_hit = False
@@ -306,29 +341,108 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# LLM prompt & extraction (now allows kg)
+# -------------------- DETAILED LLM RULES --------------------
 LLM_RULES = """
-You are an information-extraction assistant. Read the SENTENCE(S) provided and extract percentage CHANGES and/or absolute weight CHANGES (kg) that represent a reduction or change in the specified TARGET (either "HbA1c" / "A1c" or "Body weight"). Follow these rules exactly and return strict JSON only (no extra text).
+You are a focused information-extraction assistant. Read the provided SENTENCE(S) and extract **change magnitudes** that represent reported changes for the specified TARGET (either "HbA1c"/"A1c" or "Body weight"). Return strict JSON only (no explanation, no commentary, no extra text). Follow these rules exactly.
 
-OUTPUT FORMAT (exact JSON):
+OUTPUT SPECIFICATION (exact JSON structure)
+Return one JSON object. Allowed keys (you may include some or all as appropriate):
 {
-  "extracted": ["1.23%", "3.5 kg"],      // array of strings — may contain percent values (e.g. "1.23%") and/or kg values (e.g. "3.5 kg")
-  "selected_percent": "1.23%",           // single string: the best percent value (optional; empty string if none)
-  "selected_kg": "3.5 kg"                // OPTIONAL single string: the best kg value (optional; empty string or omitted if none)
+  "extracted": ["1.23%", "3.5 kg", "25.0% (relative)"],     // REQUIRED (array; may be empty). Include all plausible candidates you find in the sentence.
+  "selected_percent": "1.23%",                              // OPTIONAL: best percent value (absolute or relative) — positive magnitude, trailing '%'
+  "selected_relative_percent": "25.0%",                     // OPTIONAL: the relative % computed from a `from X% to Y%` phrase ((X - Y) / X * 100)
+  "selected_kg": "3.5 kg",                                  // OPTIONAL: best kg value (absolute, positive, suffix ' kg')
+  "confidence": 0.92                                         // OPTIONAL: number 0.0–1.0 indicating your confidence (only if available)
 }
 
-GENERAL PRINCIPLES
-- Keep the previous percent-handling rules: normalization (13·88 or 13,88 -> 13.88), ignore thresholds (>=, <), compute from X%->Y% as X-Y, prefer within-group over between-group, timepoint preference (T12 > T6), exclude SE/p-values/CIs, sign handling (selected_percent must be positive).
-- ADDED: When the sentence reports absolute weight changes in kilograms (e.g., "mean decrease of 3.64 kg" or "reduced by 3.5 kg"), include those values in the `extracted` array formatted as strings with a trailing ' kg' (use dot as decimal separator, e.g., "3.64 kg").
-- If both percent and kg values are present, include both in `extracted` and set `selected_percent` and/or `selected_kg` to indicate the LLM's best choice for each unit.
-- For `selected_kg`, return the absolute magnitude as a string with a ' kg' suffix (no sign). If no kg value is relevant, either omit `selected_kg` or set it to an empty string.
+KEY PRINCIPLES (strict)
+1) JSON-only: return exactly one JSON object and nothing else. The object must be valid JSON parseable by a machine.
 
-JSON strictness: return only the JSON object (no commentary).
+2) Normalization:
+   - Decimal separators -> '.' (examples: '13·88' or '13,88' -> '13.88').
+   - Percent strings MUST end with '%' and use '.' for decimals (e.g., "13.88%").
+   - Kg strings MUST use the format "<number> kg" with a space and 'kg' suffix (e.g., "3.64 kg").
+   - Remove typographic artifacts and extra whitespace.
+
+3) What to extract:
+   - Extract only **change magnitudes** (reported reductions or increases) relevant to the TARGET.
+   - Accept these forms (non-exhaustive): "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "mean decrease of 3.64 kg", "reduced by 3.5 kg", "from 8.5% to 7.0%".
+   - **Do NOT** extract thresholds, eligibility cutoffs or endpoints (examples: "≥5%", "HbA1c < 7.0%", "proportion achieving ≥5%"), SEs, CIs, p-values, sample-size percentages, or labels.
+   - If a percent appears in parentheses and is clearly an SE/CI (e.g., "(SE 0.90)"), do NOT extract it.
+
+4) `from X% to Y%` handling (absolute and relative):
+   - When you detect a `from X% to Y%` pattern (or wording like "declined from X% to Y%"):
+     a) Compute ABSOLUTE change in percentage points: `abs_pp = X - Y`.
+        - You may include this absolute pp (e.g., "2.00%") in `extracted` if clearly reported.
+     b) Compute RELATIVE reduction % = `((X - Y) / X) * 100`.
+        - Include the relative percent in `extracted` (optionally append " (relative)" for readability) and set `selected_relative_percent` to the normalized percent string (e.g., "25.0%") if the relative value is the best representative percent for the sentence.
+   - Normalization: compute numerically, round to sensible precision (2–3 decimals ok), and format as "N.N%".
+
+5) Units to return:
+   - Percent values: strings with '%' (e.g., "1.75%").
+   - Kg values: strings with ' kg' suffix (e.g., "3.64 kg").
+   - Return both types if both are present in the sentence (so the app can decide which to prefer).
+
+6) Drug context (`DRUG_HINT`):
+   - You will be given an optional `DRUG_HINT` string. Use it to disambiguate when multiple drugs/groups are mentioned.
+   - Prefer values that are explicitly tied to the DRUG_HINT (e.g., "in the semaglutide group ... -1.75%").
+   - If you cannot confidently tie a value to the DRUG_HINT, include candidates in `extracted` and leave `selected_*` empty.
+
+7) Timepoint preference:
+   - If multiple timepoints are present (e.g., T12, 12-mo, week 52 vs T6 or week 26), prefer values at **12 months** (T12) over 6 months (T6) and unspecified ones. When selecting the best value, prefer T12 if applicable.
+
+8) Preference / selection rules (app-level guidance):
+   - The app is configured to **prefer percent** for weight selection. So:
+     • If a percent is present and clearly represents the weight change for the target/drug, set `selected_percent` to that percent (absolute magnitude, positive).
+     • If no suitable percent exists but a kg change is present & tied to the target/drug, set `selected_kg` to that kg and also include it in `extracted`. The app may convert kg → percent later using a baseline weight.
+   - Nevertheless, still return both percent and kg (if both exist) so the app has full context.
+
+9) Sign handling:
+   - If the sentence reports negative signs (e.g., "-3.5 kg", "-1.75%"), you may put negative values in `extracted` if you want, but **selected_*** fields must be positive absolute magnitudes (no leading '+' or '-') and must include units.
+
+10) Ambiguity & fallbacks:
+   - If multiple plausible change values are present and you can confidently pick one for the DRUG_HINT and timepoint, set `selected_*` accordingly.
+   - If ambiguous (cannot tie to DRUG_HINT or cannot decide), include all plausible candidates in `extracted` and leave all `selected_*` fields empty.
+   - If you cannot find any valid change magnitude, return `"extracted": []` and omit `selected_*` fields (or set them to empty strings).
+
+11) Output strictness & validations:
+   - JSON must parse. Allowed keys: `extracted` (required), `selected_percent` (optional), `selected_relative_percent` (optional), `selected_kg` (optional), `confidence` (optional).
+   - `extracted` must be an array (can be `[]`). Each element must be a string with appropriate unit (e.g., "1.23%", "3.64 kg", "25.0% (relative)").
+   - Do not print any extra commentary, logs, or explanation.
+
+12) Formatting & rounding:
+   - Use dot decimal. Reasonable rounding: 1–3 decimal places (keep precision, but avoid unnecessary trailing zeros; e.g., "3.5 kg", "1.75%").
+   - For relative computations, 1–2 decimal places is fine (e.g., "25.0%").
+
+13) Examples (behavioral guidance — follow these examples exactly):
+   - Example A:
+       Sentence: "At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% ... (between-group difference: -13·46%)."
+       -> extracted should include "13.88%". You may include "13.46%" as additional candidate. selected_percent should be "13.88%".
+   - Example B:
+       Sentence: "Patients experienced mean decreases in HbA1c and weight from baseline to 6 months of -1.75% ... and -3.64 kg ... in the oral semaglutide group..."
+       DRUG_HINT: "semaglutide"
+       -> extracted should include "1.75%" and "3.64 kg"; selected_percent "1.75%" and selected_kg "3.64 kg" (if asked to pick both). If the app prefers percent, selected_percent must be set and used.
+   - Example C:
+       Sentence: "Declined from 8.0% to 6.0%."
+       -> absolute change = 2.0 pp; relative reduction = ((8 - 6)/8)*100 = 25.0%. Include "25.0% (relative)" in extracted and set selected_relative_percent "25.0%" if that relative value is the best representative percent for the sentence.
+   - Example D:
+       Sentence: "Mean reduction: 3,5 kg (p<0.01)."
+       -> extracted should include "3.5 kg". Do NOT include "p<0.01" or anything related to p-value.
+
+14) Edge-case rules:
+   - If percent is attached to a threshold/target context (e.g., "proportion achieving ≥5%"), do NOT treat as a reduction.
+   - If you see ranges like "1.0–1.5%" and it refers to reduction magnitude, you may include the range (normalized) or include the max value as candidate — be conservative; if unsure, include both ends or both as separate entries like "1.0%","1.5%".
+   - If multiple drugs appear and DRUG_HINT is not provided, include candidates for all and leave selected_* empty.
+
+15) Confidence (optional):
+   - If you can compute a meaningful confidence (0–1) that the returned selected_* is correct, you may include `"confidence": <float>`.
+
+That is all. RETURN ONLY THE JSON OBJECT (no commentary).
 """
 
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
-    Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_kg (string like '3.5 kg'))
+    Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_kg_or_rel (string))
     If model is None, returns ([], '', '')
     """
     if model is None or not sentence.strip():
@@ -350,7 +464,6 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
         if s != -1 and e > s:
             data = json.loads(text[s:e+1])
             extracted = []
-            # parse returned extracted list — accept both percent and kg strings
             for x in (data.get("extracted") or []):
                 if not isinstance(x, str):
                     continue
@@ -364,14 +477,13 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                             s_num = f"{num:.3f}".rstrip('0').rstrip('.')
                             extracted.append(f"{s_num} kg")
                 else:
-                    # percent values
+                    # percent
                     x2 = _norm_percent(x)
                     if re.search(r'[<>≥≤]', x2):
                         continue
                     if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
                         extracted.append(x2)
 
-            # selected percent (normalized & absolute)
             selected = _norm_percent(data.get("selected_percent", "") or "")
             if selected:
                 try:
@@ -382,21 +494,23 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 except:
                     selected = ""
 
-            # selected kg (optional)
-            selected_kg = ""
-            if 'selected_kg' in data:
+            selected_kg_or_rel = ""
+            if 'selected_kg' in data and data.get('selected_kg'):
                 sk = (data.get('selected_kg') or "").strip()
-                if sk:
-                    m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', sk)
-                    if m:
-                        num = parse_number(m.group(1))
-                        if not math.isnan(num):
-                            s_num = f"{num:.3f}".rstrip('0').rstrip('.')
-                            selected_kg = f"{s_num} kg"
+                m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', sk)
+                if m:
+                    num = parse_number(m.group(1))
+                    if not math.isnan(num):
+                        s_num = f"{num:.3f}".rstrip('0').rstrip('.')
+                        selected_kg_or_rel = f"{s_num} kg"
+            # fallback: selected_relative_percent
+            if not selected_kg_or_rel and 'selected_relative_percent' in data and data.get('selected_relative_percent'):
+                sr = _norm_percent(data.get('selected_relative_percent') or "")
+                if sr:
+                    selected_kg_or_rel = sr
 
-            return extracted, selected, selected_kg
+            return extracted, selected, selected_kg_or_rel
     except Exception:
-        # LLM failed; return empty so selected% remains empty
         return [], "", ""
 
     return [], "", ""
@@ -406,7 +520,7 @@ def compute_a1c_score(selected_pct_str: str):
     """Scores for A1c:
     5: >2.2%
     4: 1.8%-2.1%
-    3: 1.2%-1.7%     (fixing your earlier decimals)
+    3: 1.2%-1.7%
     2: 0.8%-1.1%
     1: <0.8%
     """
@@ -454,7 +568,7 @@ def compute_weight_score(selected_pct_str: str):
         return 1
     return ""
 
-# -------------------- Processing function (note _model to avoid caching errors) --------------------
+# -------------------- Processing function --------------------
 @st.cache_data
 def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
     rows = []
@@ -463,15 +577,14 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if not isinstance(text_orig, str):
             text_orig = '' if pd.isna(text_orig) else str(text_orig)
 
-        # Run regex extraction to produce the 'sentence' columns (only sentences that meet the strict criteria)
+        # Run regex extraction
         hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c')
         wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight')
 
         # Format regex outputs
         def fmt_extracted(m):
             t = (m.get('type') or '').lower()
-            if 'from-to' in t:
-                # present as delta (pp)
+            if 'from-to' in t and 'relative' not in t:
                 return fmt_pct(m.get('reduction_pp'))
             return m.get('raw', '')
 
@@ -492,13 +605,12 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if _model is not None and sentence_str:
             hba_llm_extracted, hba_selected, _ = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
 
-        # Weight LLM (now returns extracted list, selected percent, selected kg)
-        wt_llm_extracted, wt_selected, wt_selected_kg = ([], "", "")
+        # Weight LLM
+        wt_llm_extracted, wt_selected, wt_selected_fallback = ([], "", "")
         if _model is not None and weight_sentence_str:
-            wt_llm_extracted, wt_selected, wt_selected_kg = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+            wt_llm_extracted, wt_selected, wt_selected_fallback = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
         # ALSO include any kg matches found by the regex (wt_matches) into the LLM extracted list.
-        # This preserves percent-based LLM outputs and appends strings like '3.5 kg'.
         def _fmt_kg(v):
             try:
                 fv = float(v)
@@ -513,11 +625,9 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         kg_values = []
         for m in wt_matches:
             t = (m.get('type') or '').lower()
-            # detect our kg match types (we used ':kg_pmSpaces5' type in extraction)
             if ':kg' in t or 'kg' in t:
                 vals = m.get('values') or []
                 if vals:
-                    # values stored as [numeric, 'kg'] or numeric
                     v = vals[0]
                     kg_str = _fmt_kg(v)
                     if kg_str:
@@ -526,52 +636,241 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if kg_values:
             wt_llm_extracted = (wt_llm_extracted or []) + kg_values
 
-        # If LLM extracted is empty, we must ensure selected remains empty (explicit requirement)
+        # If LLM extracted is empty, ensure selected remains empty (explicit requirement)
         if not hba_llm_extracted:
             hba_selected = ""
         if not wt_llm_extracted:
             wt_selected = ""
-            wt_selected_kg = ""
 
-        # Ensure selected% is formatted and positive
+        # --- Selection logic for weight: pick HIGHEST weight-loss percentage overall ---
+        def percent_str_to_raw(pct_str):
+            if not pct_str:
+                return None
+            s = pct_str.replace('%', '').replace(',', '.').strip()
+            try:
+                return abs(float(s))
+            except:
+                return None
+
+        def kg_to_percent_raw(kg_str):
+            if not kg_str:
+                return None
+            m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', kg_str)
+            if not m:
+                return None
+            num = parse_number(m.group(1))
+            if math.isnan(num) or BASELINE_WEIGHT == 0:
+                return None
+            pct = (abs(num) / float(BASELINE_WEIGHT)) * 100.0
+            return pct
+
+        # Collect percent candidates (LLM selected percent + percent strings in LLM extracted)
+        pct_candidates = []
+        if wt_selected:
+            n = percent_str_to_raw(wt_selected)
+            if n is not None:
+                pct_candidates.append((n, _norm_percent(wt_selected)))
+        for item in (wt_llm_extracted or []):
+            if isinstance(item, str) and item.strip().endswith('%'):
+                n = percent_str_to_raw(item)
+                if n is not None:
+                    pct_candidates.append((n, _norm_percent(item.strip())))
+
+        # Collect kg candidates and convert to percent
+        kg_pct_candidates = []
+        # LLM-provided kg in fallback
+        if wt_selected_fallback and isinstance(wt_selected_fallback, str) and re.search(r'\bkg\b', wt_selected_fallback):
+            p = kg_to_percent_raw(wt_selected_fallback)
+            if p is not None:
+                kg_pct_candidates.append((p, wt_selected_fallback))
+        # kg strings in extracted list
+        for item in (wt_llm_extracted or []):
+            if isinstance(item, str) and re.search(r'\bkg\b', item):
+                p = kg_to_percent_raw(item)
+                if p is not None:
+                    kg_pct_candidates.append((p, item))
+        # regex-found kg_values
+        for k in kg_values:
+            p = kg_to_percent_raw(k)
+            if p is not None and all(k != existing[1] for existing in kg_pct_candidates):
+                kg_pct_candidates.append((p, k))
+
+        # Now pick the highest percent among pct_candidates and kg_pct_candidates
+        best_num = None
+        best_source = None  # string representation
+        if pct_candidates:
+            pct_candidates.sort(key=lambda x: x[0], reverse=True)
+            best_num = pct_candidates[0][0]
+            best_source = pct_candidates[0][1]
+        if kg_pct_candidates:
+            kg_pct_candidates.sort(key=lambda x: x[0], reverse=True)
+            if best_num is None or kg_pct_candidates[0][0] > best_num:
+                best_num = kg_pct_candidates[0][0]
+                best_source = fmt_pct(kg_pct_candidates[0][0])
+
+        final_wt_selected_pct = ""
+        if best_num is not None:
+            final_wt_selected_pct = fmt_pct(best_num)
+
+        # If nothing extracted at all, set final to empty
+        if not (wt_llm_extracted or kg_values):
+            final_wt_selected_pct = ""
+
+        # Ensure final selected percent formatted
         def normalize_selected(s):
             if not s:
                 return ""
             s2 = s.replace('%', '').replace(',', '.').strip()
             try:
                 v = float(s2)
-                v = abs(v)  # make positive on user's request
+                v = abs(v)
                 return fmt_pct(v)
             except:
                 return ""
 
-        hba_selected = normalize_selected(hba_selected)
-        wt_selected  = normalize_selected(wt_selected)
-        # wt_selected_kg already formatted as 'N kg' or empty
+        final_wt_selected_pct = normalize_selected(final_wt_selected_pct)
+
+        # ---------------------------
+        # NEW: Handle A1c similar to weight:
+        # - convert A1c absolute changes (pp) -> relative percent using BASELINE_A1C for ranking/selection
+        # - return selected A1c as percentage-points (unchanged) but choose the A1c that ranks highest by relative percent when needed
+        # ---------------------------
+
+        # Build hba candidates with relative percent conversion (relative to BASELINE_A1C)
+        hba_candidates = []  # list of tuples (pp_num, pct_str_pp, sentence_index, raw_type, rel_pct)
+        for hm in hba_matches:
+            si = hm.get('sentence_index')
+            t = (hm.get('type') or '').lower()
+            vals = hm.get('values') or []
+            num = None
+            # if explicit from-to relative percent present in regex matches (rare for A1c) use that
+            if 'from-to_relative_percent' in t and len(vals) >= 3:
+                try:
+                    num = float(vals[2])
+                except:
+                    num = None
+            elif 'from-to' in t and hm.get('reduction_pp') is not None:
+                # reduction_pp is absolute pp (X - Y)
+                try:
+                    num = float(hm.get('reduction_pp'))
+                except:
+                    num = None
+            elif vals:
+                try:
+                    # assume values[0] holds the numeric pp
+                    num = float(vals[0])
+                except:
+                    num = None
+            if num is not None and not math.isnan(num):
+                pct_str = fmt_pct(num)  # keep as pp string
+                rel = pp_to_percent_raw(num)
+                hba_candidates.append((float(num), pct_str, si, t, rel))
+
+        # Decide hba_selected:
+        # Rule: If there exists any hba_candidate that is in a sentence which has associated weight info,
+        # pick the hba candidate that belongs to the sentence with the highest weight percent.
+        # (This logic unchanged: we map weight matches to sentences and find highest per sentence.)
+        sentence_weight_pct = {}  # sentence_index -> max weight percent numeric
+        for wm in wt_matches:
+            si = wm.get('sentence_index')
+            p = None
+            t = (wm.get('type') or '').lower()
+            vals = wm.get('values') or []
+            if 'from-to_relative_percent' in t and len(vals) >= 3:
+                try:
+                    p = float(vals[2])
+                except:
+                    p = None
+            elif 'percent' in t or 'pp' in t or 'range_percent' in t:
+                if vals and isinstance(vals[0], (int, float)):
+                    try:
+                        p = float(vals[0])
+                    except:
+                        p = None
+            elif 'kg' in t and vals:
+                try:
+                    kgv = float(vals[0])
+                    p = kg_to_percent_raw_val(kgv)
+                except:
+                    p = None
+            if p is not None:
+                if si not in sentence_weight_pct or (p is not None and p > sentence_weight_pct[si]):
+                    sentence_weight_pct[si] = p
+
+        hba_selected_final = ""  # percent string (pp)
+        hba_source = ""
+
+        if hba_candidates and sentence_weight_pct:
+            # build mapping sentence -> list of hba candidates in that sentence
+            si_to_hba = {}
+            for (num, pct_str, si, t, rel) in hba_candidates:
+                si_to_hba.setdefault(si, []).append((num, pct_str, rel, t))
+            # find best sentence among those that have weight pct
+            candidate_sentences = []
+            for si, hlist in si_to_hba.items():
+                if si in sentence_weight_pct:
+                    candidate_sentences.append((sentence_weight_pct[si], si, hlist))
+            if candidate_sentences:
+                # pick sentence with highest weight percent
+                candidate_sentences.sort(key=lambda x: x[0], reverse=True)
+                best_sentence_weight_pct, best_si, hlist = candidate_sentences[0]
+                # within that sentence, pick the best hba candidate (choose the largest RELATIVE percent if available, otherwise largest pp)
+                hlist.sort(key=lambda x: (x[2] if x[2] is not None else x[0]), reverse=True)
+                chosen = hlist[0]
+                hba_selected_final = chosen[1]  # pp string
+                hba_source = f"assoc_weight_sentence_{best_si}"
+
+        # If not found via associated weight, fall back to LLM selected or highest hba candidate overall (rank by relative percent)
+        if not hba_selected_final:
+            if hba_selected:
+                hba_selected_final = _norm_percent(hba_selected)
+                hba_source = "llm_selected"
+            else:
+                if hba_candidates:
+                    # sort by relative percent (if available) else by raw pp
+                    hba_candidates.sort(key=lambda x: (x[4] if x[4] is not None else x[0]), reverse=True)
+                    hba_selected_final = hba_candidates[0][1]
+                    hba_source = "regex_highest_by_rel_or_pp"
+                else:
+                    hba_selected_final = ""
+                    hba_source = "none"
+
+        # Normalize and ensure formatting for hba_selected_final (keep as pp because scoring expects pp)
+        def normalize_selected_pct_str(s):
+            if not s:
+                return ""
+            s2 = s.replace('%', '').replace(',', '.').strip()
+            try:
+                v = float(s2)
+                v = abs(v)
+                return fmt_pct(v)
+            except:
+                return ""
+
+        hba_selected_final = normalize_selected_pct_str(hba_selected_final)
 
         # Scores
-        a1c_score = compute_a1c_score(hba_selected)
-        weight_score = compute_weight_score(wt_selected)
+        a1c_score = compute_a1c_score(hba_selected_final)
+        weight_score = compute_weight_score(final_wt_selected_pct)
 
         new = row.to_dict()
         new.update({
             'sentence': sentence_str,
             'extracted_matches': hba_regex_vals,
             'LLM extracted': hba_llm_extracted,
-            'selected %': hba_selected,
+            'selected %': hba_selected_final,
             'A1c Score': a1c_score,
             'weight_sentence': weight_sentence_str,
             'weight_extracted_matches': wt_regex_vals,
             'Weight LLM extracted': wt_llm_extracted,
-            'Weight selected %': wt_selected,
-            'Weight selected kg': wt_selected_kg,
+            'Weight selected %': final_wt_selected_pct,
             'Weight Score': weight_score,
         })
         rows.append(new)
 
     out = pd.DataFrame(rows)
 
-    # keep row if hba or weight has extracted matches (regex), or if LLM extracted exist (we assume we want rows with any data)
+    # keep row if hba or weight has extracted matches (regex), or if LLM extracted exist
     def has_items(x):
         return isinstance(x, list) and len(x) > 0
 
@@ -591,7 +890,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
     return out
 
-# Run processing (note we pass `model` in but process_df signature uses _model — avoids caching hash error)
+# Run processing
 out_df = process_df(model, df, col_name, drug_col)
 
 # -------------------- Reorder columns: place LLM columns BESIDE regex columns --------------------
@@ -608,9 +907,9 @@ def insert_after(cols, after, names):
 display_df = out_df.copy()
 cols = list(display_df.columns)
 cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
-cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight selected kg", "Weight Score"])
+cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
 # keep user columns order + these additions
-# remove duplicates, keep order
+# remove duplicates and keep order
 seen = set()
 new_cols = []
 for c in cols:
