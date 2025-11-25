@@ -1,10 +1,14 @@
-# streamlit_a1c_duration_extractor_with_hardcoded_key.py
+# streamlit_a1c_duration_extractor_with_llm.py
 """
 Streamlit app: HbA1c (A1c) extraction + scoring + duration column.
-Includes optional LLM (Gemini) extraction for A1c and duration. API key is hard-coded below.
-Fix: Streamlit caching won't attempt to hash the Gemini model object because the cached
-function's parameter name for the model starts with an underscore (`_model`).
-Usage: streamlit run streamlit_a1c_duration_extractor_with_hardcoded_key.py
+Includes optional Gemini LLM extraction for A1c and duration. The LLM will read **only** sentences that meet the criterion:
+  1) mentions A1c (A1c/HbA1c/Hb A1c),
+  2) contains a reduction cue (reduce/decrease/decline/fell/etc.), and
+  3) contains a numeric percent with a literal '%' sign.
+
+This file is a drop-in enhanced version and keeps the processing function cache-safe (model parameter named `_model`).
+
+Usage: streamlit run streamlit_a1c_duration_extractor_with_llm.py
 """
 
 import re
@@ -14,11 +18,12 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-# ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = "REPLACE_WITH_YOUR_REAL_GEMINI_API_KEY"
-# =========================================================================
+# ===================== HARD-CODE YOUR GEMINI KEY HERE (optional) =====================
+# If you prefer to hardcode, put your key here. Otherwise leave empty and provide via sidebar.
+API_KEY = ""
+# ================================================================================
 
-# Optional Gemini support (lazy import)
+# Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
 try:
     import google.generativeai as genai
@@ -26,7 +31,7 @@ try:
 except Exception:
     GENAI_AVAILABLE = False
 
-st.set_page_config(page_title="HbA1c + Duration Extractor (with LLM)", layout="wide")
+st.set_page_config(page_title="HbA1c + Duration Extractor (LLM)", layout="wide")
 st.title("HbA1c (A1c) — regex + optional Gemini LLM extraction + score + duration")
 
 # -------------------- Regex helpers --------------------
@@ -47,12 +52,9 @@ re_abs_pp    = re.compile(ABS_PP, FLAGS)
 re_range     = re.compile(RANGE_PCT, FLAGS)
 
 re_hba1c  = re.compile(r'\bhb\s*a1c\b|\bhba1c\b|\ba1c\b', FLAGS)
-re_reduction_cue = re.compile(
-    r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b',
-    FLAGS
-)
+re_reduction_cue = re.compile(r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b', FLAGS)
 
-# Duration regex
+# Duration regex (fallback)
 DURATION_RE = re.compile(
     r'\b(?:T\d{1,2}|'                                       # T6, T12
     r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:weeks?|wks?|wk|w)\b|'   # 12 weeks, 6-12 weeks
@@ -64,6 +66,7 @@ DURATION_RE = re.compile(
 )
 
 # -------------------- Utilities --------------------
+
 def parse_number(s: str) -> float:
     if s is None:
         return float('nan')
@@ -73,18 +76,21 @@ def parse_number(s: str) -> float:
     except Exception:
         return float('nan')
 
+
 def split_sentences(text: str):
     if not isinstance(text, str):
         return []
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    parts = re.split(r'(?<=[\.!\?])\s+|\n+', text)
+    parts = re.split(r'(?<=[\.\!\?])\s+|\n+', text)
     return [p.strip() for p in parts if p and p.strip()]
+
 
 def fmt_pct(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return ''
     s = f"{float(v):.2f}".rstrip('0').rstrip('.')
     return f"{s}%"
+
 
 def extract_durations_regex(text: str) -> str:
     if not isinstance(text, str) or not text.strip():
@@ -107,7 +113,7 @@ def extract_durations_regex(text: str) -> str:
             found.append(token)
     return ' | '.join(found)
 
-# Window helper (±5 spaces)
+# small window builder used to search near the target term (±5 spaces inclusive tokens)
 def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: int = 5, n_next_spaces: int = 5):
     space_like = set([' ', '\t', '\n', '\r'])
     L = len(s)
@@ -148,6 +154,7 @@ def window_prev_next_spaces_inclusive_tokens(s: str, pos: int, n_prev_spaces: in
     end = max(start, min(end if end != pos else L, L))
     return s[start:end], start, end
 
+
 def add_match(out, si, abs_start, m, typ, values, reduction):
     out.append({
         'raw': m.group(0) if hasattr(m, 'group') else str(m),
@@ -158,9 +165,11 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
         'span': (abs_start + (m.start() if hasattr(m, 'start') else 0), abs_start + (m.end() if hasattr(m, 'end') else 0)),
     })
 
-# -------------------- Core regex extraction for A1c --------------------
+# -------------------- Core extraction (regex) --------------------
 def extract_in_sentence_regex(sent: str, si: int):
     matches = []
+
+    # 1) WHOLE-SENTENCE: from X% to Y%
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1)); b = parse_number(m.group(2))
         red_pp = None if (math.isnan(a) or math.isnan(b)) else (a - b)
@@ -179,6 +188,7 @@ def extract_in_sentence_regex(sent: str, si: int):
                 'span': (m.start(), m.end()),
             })
 
+    # 2) ±5-SPACES window around each A1c occurrence: other patterns only
     any_window_hit = False
     for hh in re_hba1c.finditer(sent):
         seg, abs_s, _ = window_prev_next_spaces_inclusive_tokens(sent, hh.end(), 5, 5)
@@ -215,31 +225,59 @@ def extract_in_sentence_regex(sent: str, si: int):
     uniq.sort(key=lambda x: x['span'][0])
     return uniq
 
-def sentence_meets_criterion_regex(sent: str) -> bool:
+
+def sentence_meets_criterion(sent: str) -> bool:
+    """Return True only if the sentence contains all three:
+      1) an A1c mention (A1c/HbA1c/Hb a1c variants),
+      2) a reduction cue word (reduce/decrease/etc.), and
+      3) a numeric percent with a literal '%' sign (not a cutoff like '>=5%').
+    """
     has_term = bool(re_hba1c.search(sent))
-    has_pct = bool(re_pct.search(sent))
+    # require a literal percent sign and avoid relational operators immediately adjacent
+    has_pct = bool(re.search(r"(?<![<>≥≤])" + PCT, sent))
+    # reduction cue (reduce, decrease, decline, fell, etc.)
     has_cue = bool(re_reduction_cue.search(sent))
-    return has_term and has_pct and has_cue
+    return bool(has_term and has_pct and has_cue)
 
-# -------------------- LLM extraction for A1c + duration --------------------
-LLM_RULES_A1C_DURATION = r"""
-You are an information-extraction assistant. Read the supplied SENTENCE(S) and extract change magnitudes relevant to HbA1c/A1c and any trial/timepoint duration that applies to the reported result.
-Return EXACTLY one JSON object and nothing else.
 
+def extract_sentences(text: str):
+    matches, sentences_used = [], []
+    for si, sent in enumerate(split_sentences(text)):
+        if not sentence_meets_criterion(sent):
+            continue
+        sentences_used.append(sent)
+        matches.extend(extract_in_sentence_regex(sent, si))
+
+    # dedupe globally by (sentence_index, span)
+    seen, filtered = set(), []
+    for mm in matches:
+        key = (mm['sentence_index'], mm['span'])
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(mm)
+    filtered.sort(key=lambda x: (x['sentence_index'], x['span'][0]))
+    return filtered, sentences_used
+
+# -------------------- LLM rules & helpers --------------------
+LLM_RULES = """
+You are an extraction assistant. Input: a set of SENTENCES that each mention HbA1c/A1c, a reduction cue, and a percent.
+Return exactly one JSON object, no extra text.
 Allowed keys:
 {
-  "extracted": ["1.23%"],          // array of candidate percent magnitudes (strings, may be empty)
-  "selected_percent": "1.23%",    // OPTIONAL: best single percent (positive, with %)
-  "duration": "12 months",        // OPTIONAL: duration/timepoint associated with the result (e.g., "T12", "12 months", "6 weeks")
-  "confidence": 0.87                // OPTIONAL: confidence 0.0-1.0
+  "extracted": ["1.75%", "2.0%"],
+  "selected_percent": "1.75%",   // optional
+  "duration": "12 months",       // optional
+  "confidence": 0.9                // optional
 }
-
 Rules:
-- Percent strings must use dot decimal and end with '%', e.g., "1.75%".
-- Duration strings should be human-readable (examples: "T12", "12 months", "6-12 weeks", "26 weeks").
-- If you detect a `from X% to Y%` phrase, compute relative reduction percent using ((X - Y) / Y) * 100 and include it among "extracted" AND set "selected_percent" to the relative if it is the clearest representation.
-- Do NOT emit any other text or commentary. Output must be valid JSON.
+- Percent strings must use '.' decimal and end with '%'.
+- Duration should be human readable (e.g., 'T12', '12 months', '26 weeks').
+- If a 'from X% to Y%' is present, compute relative reduction ((X - Y) / Y) * 100 and include it.
+- Only extract change magnitudes (do not extract thresholds like '>=5%').
+- Return strict JSON only.
 """
+
 
 def configure_gemini(api_key: str):
     if not GENAI_AVAILABLE or not api_key:
@@ -250,6 +288,7 @@ def configure_gemini(api_key: str):
     except Exception:
         return None
 
+
 def _norm_percent(v: str) -> str:
     v = (v or "").strip().replace(" ", "")
     if v and not v.endswith("%"):
@@ -257,14 +296,13 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-def llm_extract_a1c_and_duration(model, sentences: str):
-    """Call LLM to extract JSON. Returns (extracted_list, selected_percent, duration_str) or ([], '', '') on failure."""
+
+def llm_extract_from_sentences(model, sentences: str):
+    """Call LLM with the short set of sentences. Returns (extracted_list, selected_percent, duration)
+    On failure returns ([], '', '')."""
     if model is None or not sentences or not sentences.strip():
         return [], "", ""
-
-    prompt = (
-        "SENTENCES:\n" + sentences + "\n\n" + LLM_RULES_A1C_DURATION + "\nReturn JSON only."
-    )
+    prompt = "SENTENCES:\n" + sentences + "\n\n" + LLM_RULES + "\nReturn JSON only."
     try:
         resp = model.generate_content(prompt)
         text = (getattr(resp, "text", "") or "").strip()
@@ -277,7 +315,6 @@ def llm_extract_a1c_and_duration(model, sentences: str):
                     continue
                 x2 = _norm_percent(x)
                 if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
-                    # normalize
                     n = parse_number(x2.replace('%', ''))
                     if not math.isnan(n):
                         extracted.append(fmt_pct(abs(n)))
@@ -296,7 +333,15 @@ def llm_extract_a1c_and_duration(model, sentences: str):
     return [], "", ""
 
 # -------------------- Scoring --------------------
+
 def compute_a1c_score(selected_pct_str: str):
+    """Scores for A1c:
+    5: >2.2%
+    4: 1.8%-2.1%
+    3: 1.2%-1.7%
+    2: 0.8%-1.1%
+    1: <0.8%
+    """
     if not selected_pct_str:
         return ""
     try:
@@ -316,7 +361,7 @@ def compute_a1c_score(selected_pct_str: str):
     return ""
 
 # -------------------- Processing --------------------
-# NOTE: rename the model parameter to _model so Streamlit's cache won't try to hash the model object
+# Note: rename model argument to _model so Streamlit's cache does not try to hash it.
 @st.cache_data
 def process_df(df_in: pd.DataFrame, text_col: str, _model, use_llm: bool):
     rows = []
@@ -325,16 +370,12 @@ def process_df(df_in: pd.DataFrame, text_col: str, _model, use_llm: bool):
         if not isinstance(text_orig, str):
             text_orig = '' if pd.isna(text_orig) else str(text_orig)
 
-        # Duration by regex (always available)
+        # Extract regex durations as fallback
         duration_regex = extract_durations_regex(text_orig)
 
-        # Regex-based A1c
-        hba_matches, hba_sentences = [], []
-        for si, sent in enumerate(split_sentences(text_orig)):
-            if not sentence_meets_criterion_regex(sent):
-                continue
-            hba_sentences.append(sent)
-            hba_matches.extend(extract_in_sentence_regex(sent, si))
+        # Extract qualifying sentences and regex matches
+        hba_matches, hba_sentences = extract_sentences(text_orig)
+        sentences_joined = ' | '.join(hba_sentences) if hba_sentences else ''
 
         # Format regex outputs
         def fmt_extracted(m):
@@ -357,18 +398,15 @@ def process_df(df_in: pd.DataFrame, text_col: str, _model, use_llm: bool):
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
 
-        # LLM extraction (if enabled)
-        llm_extracted = []
-        llm_selected = ''
-        llm_duration = ''
-        sentences_joined = ' | '.join(hba_sentences) if hba_sentences else ''
+        # LLM extraction (only read the qualifying sentences)
+        llm_extracted, llm_selected, llm_duration = [], '', ''
         if use_llm and _model and sentences_joined:
-            llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(_model, sentences_joined)
+            llm_extracted, llm_selected, llm_duration = llm_extract_from_sentences(_model, sentences_joined)
 
-        # Preference: if LLM gave a duration use it, else use regex duration
+        # Duration: prefer LLM duration if present
         final_duration = llm_duration if llm_duration else duration_regex
 
-        # Choose selected percent: prefer LLM selected, else precomputed relative from regex, else first percent from regex
+        # Determine selected percent: priority = LLM.selected -> precomputed relative (regex) -> first regex percent
         def _find_precomputed_relative(matches):
             for m in matches:
                 t = (m.get('type') or '').lower()
@@ -397,108 +435,4 @@ def process_df(df_in: pd.DataFrame, text_col: str, _model, use_llm: bool):
         else:
             for it in hba_regex_vals:
                 if isinstance(it, str) and it.strip().endswith('%'):
-                    s2 = it.replace('%', '').replace(',', '.').strip()
-                    try:
-                        v = float(s2)
-                        selected = fmt_pct(abs(v))
-                        break
-                    except:
-                        continue
-
-        a1c_score = compute_a1c_score(selected)
-
-        new = row.to_dict()
-        new.update({
-            'sentence': sentences_joined,
-            'extracted_matches': hba_regex_vals,
-            'LLM extracted': llm_extracted,
-            'selected %': selected,
-            'A1c Score': a1c_score,
-            'duration': final_duration,
-        })
-        rows.append(new)
-
-    out = pd.DataFrame(rows)
-
-    # keep rows that have extraction (regex or LLM)
-    def has_items(x):
-        return isinstance(x, list) and len(x) > 0
-
-    mask = (out['sentence'].astype(str).str.len() > 0) & ((out['extracted_matches'].apply(has_items)) | (out['LLM extracted'].apply(has_items)))
-    out = out[mask].reset_index(drop=True)
-
-    out.attrs['counts'] = dict(kept=int(mask.sum()), total=int(len(out)))
-    return out
-
-# -------------------- UI --------------------
-st.sidebar.header('Options')
-use_llm = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash) for A1c + duration', value=False)
-uploaded   = st.sidebar.file_uploader('Upload Excel (.xlsx) or CSV', type=['xlsx', 'xls', 'csv'])
-col_name   = st.sidebar.text_input('Column with abstracts/text', value='abstract')
-show_debug = st.sidebar.checkbox('Show debug columns (extracted_matches, LLM extracted, sentence)', value=True)
-
-if not uploaded:
-    st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
-    st.stop()
-
-try:
-    if uploaded.name.lower().endswith('.csv'):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded, sheet_name=0)
-except Exception as e:
-    st.error(f'Failed to read file: {e}')
-    st.stop()
-
-if col_name not in df.columns:
-    st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
-    st.stop()
-
-# Configure model
-model = None
-if use_llm:
-    if not GENAI_AVAILABLE:
-        st.warning('google.generativeai (Gemini SDK) not available — LLM disabled.')
-        use_llm = False
-    else:
-        model = configure_gemini(API_KEY)
-        if model is None:
-            st.warning('Failed to configure Gemini model — check API key and environment. LLM disabled.')
-            use_llm = False
-
-st.success(f'Loaded {len(df)} rows. Processing...')
-
-# pass `model` into the cached function as `_model` (Streamlit won't try to hash it)
-out_df = process_df(df, col_name, model, use_llm)
-
-# Reorder columns so duration is last
-if 'duration' in out_df.columns:
-    cols_no_duration = [c for c in out_df.columns if c != 'duration']
-    cols_no_duration.append('duration')
-    out_df = out_df[cols_no_duration]
-
-st.write("### Results (first 200 rows shown)")
-if not show_debug:
-    for c in ['extracted_matches', 'LLM extracted', 'sentence']:
-        if c in out_df.columns:
-            out_df = out_df.drop(columns=[c])
-
-st.dataframe(out_df.head(200))
-
-counts = out_df.attrs.get('counts', None)
-if counts:
-    kept = counts.get('kept', 0)
-    total = counts.get('total', 0)
-    st.caption(f"Kept {kept} rows with A1c extraction (from {total} processed rows).")
-
-# Download
-@st.cache_data
-def to_excel_bytes(df_out):
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df_out.to_excel(writer, index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-excel_bytes = to_excel_bytes(out_df)
-st.download_button('Download results as Excel', data=excel_bytes, file_name='a1c_results_with_duration_and_llm.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    s2 = it.replace('%', '').replace(',', '.')
