@@ -9,8 +9,11 @@ Logic:
    - Contain a number with '%'
 2. These shortlisted sentences are sent to the LLM.
 3. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
-4. LLM also reads the FULL ABSTRACT to find duration.
-5. Among available values, it selects the best A1c value and a score is assigned.
+4. For phrases like "from X% to Y%", the LLM computes the RELATIVE reduction as:
+       ((X - Y) / X) * 100
+   and includes this as a candidate and (by default) selects it as the main A1c reduction.
+5. LLM also reads the FULL ABSTRACT to find duration.
+6. Among available values, it selects the best A1c value and a score is assigned.
 
 Columns:
 - shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
@@ -21,20 +24,27 @@ Columns:
 - LLM_status: shows whether LLM ran and returned something (OK / NO OUTPUT / DISABLED / NO SENTENCES)
 
 Usage:
+    # set your key in environment (recommended)
+    # Windows (cmd):   set GEMINI_API_KEY=YOUR_KEY
+    # PowerShell:      $env:GEMINI_API_KEY="YOUR_KEY"
+    # macOS/Linux:     export GEMINI_API_KEY=YOUR_KEY
+
     streamlit run streamlit_a1c_llm_duration.py
 """
 
 import re
 import math
 import json
+import os
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 
-# ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = "REPLACE_WITH_YOUR_REAL_GEMINI_KEY"
-# ==========================================================================
+# ===================== GEMINI KEY (from environment) =====================
+# Set GEMINI_API_KEY in your OS environment before running Streamlit.
+API_KEY = os.getenv("GEMINI_API_KEY", "")
+# ========================================================================
 
 # Lazy import of Gemini so the app can still run without it
 GENAI_AVAILABLE = False
@@ -205,8 +215,9 @@ def extract_in_sentence(sent: str, si: int):
         b = parse_number(m.group(2))
         red_pp = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         rel = None
-        if not (math.isnan(a) or math.isnan(b)) and b != 0:
-            rel = ((a - b) / b) * 100.0
+        # RELATIVE reduction = ((X - Y) / X) * 100  (baseline X)
+        if not (math.isnan(a) or math.isnan(b)) and a != 0:
+            rel = ((a - b) / a) * 100.0
         add_match(matches, si, 0, m, "from-to_sentence", [a, b], red_pp)
         if rel is not None:
             rel_raw = f"{rel:.6f}%"
@@ -319,18 +330,45 @@ INPUT:
 
 TASKS:
 1) From SENTENCES_FOR_A1C, extract all A1c/HbA1c change magnitudes (percent reductions), and choose the best single value.
-   - Include both group-specific reductions (e.g., "1.75% in oral semaglutide") and differences between groups (e.g., "0.4% greater reduction").
+   - Include:
+     • group-specific reductions (e.g., "1.75% in oral semaglutide"),
+     • between-group differences (e.g., "0.4% greater reduction"),
+     • and relative reductions computed from 'from X% to Y%' patterns (see special rule).
 2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
 
 Return exactly ONE JSON object and NO extra text.
 
 Allowed keys:
 {
-  "extracted": ["1.75%", "1.35%", "0.4%"],
-  "selected_percent": "1.75%",
+  "extracted": ["1.75%", "1.35%", "0.4%", "25.0%"],
+  "selected_percent": "25.0%",
   "duration": "6 months",
   "confidence": 0.9
 }
+
+Rules for A1c reductions:
+- Percent strings must represent change magnitudes in A1c/HbA1c, NOT thresholds or goals.
+- In the JSON, percent values must be plain numeric strings with '%', e.g. "1.75%".
+- Ignore:
+  - thresholds like ">=5%" or "HbA1c <7.0%",
+  - sample-size percentages,
+  - p-values, confidence intervals, etc.
+
+SPECIAL RULE: 'from X% to Y%' PATTERNS
+- When you see a phrase like "HbA1c decreased from X% to Y%" or "reduced from X% to Y%":
+  1) Compute the relative reduction using the BASELINE X:
+       relative_reduction = ((X - Y) / X) * 100
+     (Use X in the denominator, NOT Y.)
+  2) Normalize and round to a reasonable number of decimals (e.g., "25.0%").
+  3) Add this relative reduction to the `extracted` array.
+  4) **By default, set `selected_percent` to this relative reduction**, unless there is a clearly more important A1c reduction value mentioned.
+
+Duration rule:
+- Duration must be human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
+- If multiple timepoints are present, pick the one most clearly tied to the main A1c result
+  (prefer 12 months/T12 over 6 months/T6 when ambiguous).
+
+Output must be STRICT JSON and parseable.
 """
 
 def configure_gemini(api_key: str):
@@ -338,7 +376,7 @@ def configure_gemini(api_key: str):
         return None
     try:
         genai.configure(api_key=api_key)
-        # note: adjust model name if your library expects "models/gemini-2.0-flash"
+        # adjust model name if your client expects "models/gemini-2.0-flash"
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
@@ -361,7 +399,6 @@ def get_resp_text(resp):
             parts = resp.candidates[0].content.parts
             chunks = []
             for p in parts:
-                # p.text for text parts
                 t = getattr(p, "text", None)
                 if isinstance(t, str):
                     chunks.append(t)
@@ -496,7 +533,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         hba_matches, hba_sentences = extract_sentences(text_orig)
         shortlisted = " | ".join(hba_sentences) if hba_sentences else ""
 
-        # Precomputed relative from-to if available
+        # Precomputed relative from-to if available (REL = ((X - Y) / X) * 100)
         def _find_precomputed_relative(matches):
             for m in matches:
                 t = (m.get("type") or "").lower()
@@ -511,8 +548,8 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
                     if len(vals) >= 2:
                         a = vals[0]
                         b = vals[1]
-                        if not (math.isnan(a) or math.isnan(b)) and b != 0:
-                            rel = ((a - b) / b) * 100.0
+                        if not (math.isnan(a) or math.isnan(b)) and a != 0:
+                            rel = ((a - b) / a) * 100.0
                             return fmt_pct(rel)
             return None
 
@@ -589,7 +626,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
                 "shortlisted_sentences": shortlisted,
                 "sentence": shortlisted,  # debug compatibility
                 "extracted_matches": hba_regex_vals,
-                "LLM extracted": llm_extracted,  # debug list (list in app; string in Excel)
+                "LLM extracted": llm_extracted,  # debug list
                 "A1c reduction values": a1c_reduction_values_str,
                 "selected %": selected,
                 "A1c Score": a1c_score,
@@ -659,7 +696,7 @@ if use_llm:
     else:
         key = API_KEY.strip()
         if not key:
-            st.error("No Gemini API key set (API_KEY is empty). LLM disabled.")
+            st.error("No GEMINI_API_KEY environment variable set. LLM disabled.")
             use_llm = False
         else:
             model = configure_gemini(key)
