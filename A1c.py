@@ -18,7 +18,8 @@ Logic:
 Columns:
 - shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
 - A1c reduction values: ALL A1c reduction values extracted by the LLM (joined with " | ")
-- selected %: chosen A1c reduction (LLM-preferred, regex fallback)
+- selected %: chosen A1c reduction (LLM-preferred, regex fallback), BUT:
+      If all A1c reduction values from the LLM are 0 → selected % is forced to 0%.
 - A1c Score: score based on selected %
 - duration: trial/timepoint duration (LLM preferred, regex fallback)
 - LLM_status: shows whether LLM ran and returned something (OK / NO OUTPUT / DISABLED / NO SENTENCES)
@@ -598,22 +599,39 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         # Final duration: prefer LLM duration; else regex
         final_duration = llm_duration if llm_duration else duration_regex
 
-        # Selected percent: prefer LLM, else precomputed_rel, else first regex
-        selected = ""
-        if llm_selected:
-            selected = llm_selected
-        elif precomputed_rel:
-            selected = precomputed_rel
+        # -------- NEW RULE: if A1c reduction values from LLM are all 0 -> selected % = 0% --------
+        all_llm_zero = False
+        if llm_extracted:
+            nums = []
+            for item in llm_extracted:
+                if isinstance(item, str):
+                    m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)', item)
+                    if m:
+                        v = parse_number(m.group(1))
+                        if not math.isnan(v):
+                            nums.append(abs(v))
+            if nums and all(v == 0 for v in nums):
+                all_llm_zero = True
+
+        # Selected percent: apply your rule first, then normal precedence
+        if all_llm_zero:
+            selected = fmt_pct(0.0)  # force 0%
         else:
-            for it in hba_regex_vals:
-                if isinstance(it, str) and it.strip().endswith("%"):
-                    s2 = it.replace("%", "").replace(",", ".").strip()
-                    try:
-                        v = float(s2)
-                        selected = fmt_pct(abs(v))
-                        break
-                    except Exception:
-                        continue
+            selected = ""
+            if llm_selected:
+                selected = llm_selected
+            elif precomputed_rel:
+                selected = precomputed_rel
+            else:
+                for it in hba_regex_vals:
+                    if isinstance(it, str) and it.strip().endswith("%"):
+                        s2 = it.replace("%", "").replace(",", ".").strip()
+                        try:
+                            v = float(s2)
+                            selected = fmt_pct(abs(v))
+                            break
+                        except Exception:
+                            continue
 
         a1c_score = compute_a1c_score(selected)
 
