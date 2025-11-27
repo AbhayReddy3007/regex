@@ -18,6 +18,7 @@ Columns:
 - selected %: chosen A1c reduction (LLM-preferred, regex fallback)
 - A1c Score: score based on selected %
 - duration: trial/timepoint duration (LLM preferred, regex fallback)
+- LLM_status: shows whether LLM ran and returned something (OK / NO OUTPUT / DISABLED / NO SENTENCES)
 
 Usage:
     streamlit run streamlit_a1c_llm_duration.py
@@ -318,16 +319,17 @@ INPUT:
 
 TASKS:
 1) From SENTENCES_FOR_A1C, extract all A1c/HbA1c change magnitudes (percent reductions), and choose the best single value.
+   - Include both group-specific reductions (e.g., "1.75% in oral semaglutide") and differences between groups (e.g., "0.4% greater reduction").
 2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
 
 Return exactly ONE JSON object and NO extra text.
 
 Allowed keys:
 {
-  "extracted": ["1.75%", "2.0%"],   // array of candidate percent magnitudes (strings, may be empty)
-  "selected_percent": "1.75%",      // OPTIONAL: best single percent reduction (positive, with %)
-  "duration": "12 months",          // OPTIONAL: duration/timepoint (e.g., "T12", "12 months", "26 weeks")
-  "confidence": 0.9                 // OPTIONAL: confidence (0.0 - 1.0)
+  "extracted": ["1.75%", "1.35%", "0.4%"],   // array of candidate percent magnitudes (strings, may be empty)
+  "selected_percent": "1.75%",               // OPTIONAL: best single percent reduction (positive, with %)
+  "duration": "6 months",                    // OPTIONAL: duration/timepoint (e.g., "T12", "12 months", "26 weeks")
+  "confidence": 0.9                          // OPTIONAL: confidence (0.0 - 1.0)
 }
 
 Rules:
@@ -354,11 +356,6 @@ def configure_gemini(api_key: str):
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
-
-
-def _norm_percent(v: str) -> str:
-    v = (v or "").strip()
-    return v
 
 
 def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
@@ -397,7 +394,7 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
         data = json.loads(text[s : e + 1])
 
         extracted = []
-        # ---- tolerant parsing: pull numbers (with or without %) from any strings ----
+        # tolerant parsing: pull numbers (with or without %) from any strings
         for x in (data.get("extracted") or []):
             if not isinstance(x, str):
                 continue
@@ -522,6 +519,16 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
                 model, shortlisted, text_orig
             )
 
+        # Determine LLM_status for this row
+        if not use_llm or model is None:
+            llm_status = "LLM DISABLED"
+        elif not shortlisted:
+            llm_status = "NO A1c SENTENCES"
+        elif not llm_extracted and not llm_selected and not llm_duration:
+            llm_status = "LLM NO OUTPUT"
+        else:
+            llm_status = "LLM OK"
+
         # Final duration: prefer LLM duration; else regex
         final_duration = llm_duration if llm_duration else duration_regex
 
@@ -551,13 +558,14 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         new.update(
             {
                 "shortlisted_sentences": shortlisted,
-                "sentence": shortlisted,  # keep for debug compatibility
+                "sentence": shortlisted,  # debug compatibility
                 "extracted_matches": hba_regex_vals,
                 "LLM extracted": llm_extracted,  # debug list
-                "A1c reduction values": a1c_reduction_values_str,  # user-facing
+                "A1c reduction values": a1c_reduction_values_str,
                 "selected %": selected,
                 "A1c Score": a1c_score,
                 "duration": final_duration,
+                "LLM_status": llm_status,
             }
         )
         rows.append(new)
@@ -617,17 +625,17 @@ if col_name not in df.columns:
 model = None
 if use_llm:
     if not GENAI_AVAILABLE:
-        st.warning("google.generativeai not available — LLM disabled.")
+        st.error("google.generativeai is not installed or not importable — LLM disabled.")
         use_llm = False
     else:
         key = API_KEY.strip()
         if not key:
-            st.warning("No Gemini API key set (API_KEY is empty). LLM disabled.")
+            st.error("No Gemini API key set (API_KEY is empty). LLM disabled.")
             use_llm = False
         else:
             model = configure_gemini(key)
             if model is None:
-                st.warning("Failed to configure Gemini model. LLM disabled.")
+                st.error("Failed to configure Gemini model (check key or network). LLM disabled.")
                 use_llm = False
 
 st.success(f"Loaded {len(df)} rows. Processing...")
@@ -643,12 +651,17 @@ if "duration" in out_df.columns:
 st.write("### Results (first 200 rows shown)")
 display_df = out_df.copy()
 if not show_debug:
-    # Hide only debug columns, keep "A1c reduction values" visible
+    # Hide only debug columns, keep "A1c reduction values" & "LLM_status" visible
     for c in ["extracted_matches", "LLM extracted", "sentence"]:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
 
 st.dataframe(display_df.head(200))
+
+# Global LLM-status message
+if use_llm and not out_df.empty:
+    if (display_df["LLM_status"] == "LLM OK").sum() == 0:
+        st.error("LLM seems to be enabled but did not return any usable output for any row.")
 
 counts = out_df.attrs.get("counts", None)
 if counts:
