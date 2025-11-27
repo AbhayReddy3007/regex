@@ -11,11 +11,12 @@ Logic:
 3. LLM also reads the FULL ABSTRACT to find duration.
 4. Among available values, it selects the best A1c value and a score is assigned.
 
-Extra columns:
-- `shortlisted_sentences`: the sentences that passed the filters.
-- `selected %`: the chosen A1c reduction.
-- `A1c Score`: score based on selected %.
-- `duration`: trial/timepoint duration (LLM preferred, regex fallback).
+Columns:
+- shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
+- A1c reduction values: ALL A1c reduction values extracted by the LLM (joined with " | ")
+- selected %: chosen A1c reduction
+- A1c Score: score based on selected %
+- duration: trial/timepoint duration (LLM preferred, regex fallback)
 
 Usage:
     streamlit run streamlit_a1c_llm_duration.py
@@ -50,8 +51,10 @@ PCT = rf'({NUM})\s*%'
 DASH = r'(?:-|–|—)'
 
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
-REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|' \
-            rf'drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
+REDUCE_BY = (
+    rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|'
+    rf'drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
+)
 ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
 RANGE_PCT = rf'({NUM})\s*{DASH}\s*({NUM})\s*%'
 
@@ -529,13 +532,17 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
         a1c_score = compute_a1c_score(selected)
 
+        # New column: all LLM A1c reduction values as a single string
+        a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
+
         new = row.to_dict()
         new.update(
             {
                 "shortlisted_sentences": shortlisted,
                 "sentence": shortlisted,  # keep for debug compatibility
                 "extracted_matches": hba_regex_vals,
-                "LLM extracted": llm_extracted,
+                "LLM extracted": llm_extracted,  # debug list
+                "A1c reduction values": a1c_reduction_values_str,  # NEW, user-facing
                 "selected %": selected,
                 "A1c Score": a1c_score,
                 "duration": final_duration,
@@ -624,6 +631,7 @@ if "duration" in out_df.columns:
 st.write("### Results (first 200 rows shown)")
 display_df = out_df.copy()
 if not show_debug:
+    # Hide only debug columns, keep "A1c reduction values" visible
     for c in ["extracted_matches", "LLM extracted", "sentence"]:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
