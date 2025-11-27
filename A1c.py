@@ -307,12 +307,14 @@ def extract_sentences(text: str):
 LLM_RULES = r"""
 You are an extraction assistant.
 
+IMPORTANT: Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same measurement (they are synonyms).
+
 INPUT:
-- SENTENCES_FOR_A1C: a small set of sentences that each mention HbA1c/A1c, a reduction cue, and contain a percent.
+- SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c, a reduction cue, and contain a percent.
 - FULL_ABSTRACT_FOR_DURATION: the entire abstract text.
 
 TASKS:
-1) From SENTENCES_FOR_A1C, extract all HbA1c change magnitudes (percent reductions), and choose the best single value.
+1) From SENTENCES_FOR_A1C, extract all HbA1c/A1c change magnitudes (percent reductions), and choose the best single value.
 2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
 
 Return exactly ONE JSON object and NO extra text.
@@ -329,7 +331,7 @@ Rules:
 - Percent strings:
   - Must use '.' as decimal separator.
   - Must end with '%', e.g., "1.75%".
-  - Represent *change magnitudes* in HbA1c (reductions), NOT thresholds or goals.
+  - Represent *change magnitudes* in A1c/HbA1c, NOT thresholds or goals.
 - Duration:
   - Human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
   - If multiple timepoints, pick the one most clearly tied to the main A1c result (prefer 12 months/T12 over 6 months/T6 when ambiguous).
@@ -532,7 +534,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
         a1c_score = compute_a1c_score(selected)
 
-        # New column: all LLM A1c reduction values as a single string
+        # Column: all LLM A1c reduction values as a single string
         a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
 
         new = row.to_dict()
@@ -542,7 +544,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
                 "sentence": shortlisted,  # keep for debug compatibility
                 "extracted_matches": hba_regex_vals,
                 "LLM extracted": llm_extracted,  # debug list
-                "A1c reduction values": a1c_reduction_values_str,  # NEW, user-facing
+                "A1c reduction values": a1c_reduction_values_str,  # user-facing
                 "selected %": selected,
                 "A1c Score": a1c_score,
                 "duration": final_duration,
