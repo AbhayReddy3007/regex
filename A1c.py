@@ -3,13 +3,19 @@
 Streamlit app: HbA1c (A1c) extraction + scoring + duration column using regex + Gemini LLM.
 
 Logic:
-1. Regex filters sentences to ONLY those that:
+1. Regex finds ONLY sentences that:
    - Mention A1c / HbA1c / Hb A1c
    - Contain a reduction cue (reduce/decrease/decline/fell/...)
-   - Contain a number followed by '%' (not just cutoffs)
-2. LLM reads ONLY those sentences to extract A1c reduction values.
+   - Contain a number followed by '%'
+2. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
 3. LLM also reads the FULL ABSTRACT to find duration.
-4. Among available values, it selects the best A1c value and we assign a score.
+4. Among available values, it selects the best A1c value and a score is assigned.
+
+Extra columns:
+- `shortlisted_sentences`: the sentences that passed the filters.
+- `selected %`: the chosen A1c reduction.
+- `A1c Score`: score based on selected %.
+- `duration`: trial/timepoint duration (LLM preferred, regex fallback).
 
 Usage:
     streamlit run streamlit_a1c_llm_duration.py
@@ -27,7 +33,7 @@ import streamlit as st
 API_KEY = "REPLACE_WITH_YOUR_REAL_GEMINI_KEY"
 # ==========================================================================
 
-# Lazy import of Gemini so the app still runs without the package
+# Lazy import of Gemini so the app can still run without it
 GENAI_AVAILABLE = False
 try:
     import google.generativeai as genai
@@ -44,7 +50,8 @@ PCT = rf'({NUM})\s*%'
 DASH = r'(?:-|–|—)'
 
 FROM_TO   = rf'from\s+({NUM})\s*%\s*(?:to|->|{DASH})\s*({NUM})\s*%'
-REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
+REDUCE_BY = rf'(?:reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|' \
+            rf'drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\s*(?:by\s*)?({NUM})\s*%'
 ABS_PP    = rf'(?:absolute\s+reduction\s+of|reduction\s+of)\s*({NUM})\s*%'
 RANGE_PCT = rf'({NUM})\s*{DASH}\s*({NUM})\s*%'
 
@@ -142,7 +149,7 @@ def window_prev_next_spaces_inclusive_tokens(
         else:
             i -= 1
     j = left_boundary_start - 1
-    while j >= 0 and j < len(s) and s[j] not in space_like:
+    while j >= 0 and s[j] not in space_like:
         j -= 1
     start = j + 1
 
@@ -266,7 +273,7 @@ def sentence_meets_criterion(sent: str) -> bool:
     Sentence must have:
       1) A1c/HbA1c mention
       2) a reduction cue
-      3) a numeric % (not just >=5%)
+      3) a numeric % (not just >=5%, <=7%, etc.)
     """
     has_term = bool(re_hba1c.search(sent))
     has_pct = bool(re.search(r"(?<![<>≥≤])" + PCT, sent))
@@ -434,7 +441,7 @@ def compute_a1c_score(selected_pct_str: str):
     return ""
 
 # -------------------- Processing --------------------
-def process_df(df_in: pd.DataFrame, text_col: str, use_llm: bool):
+def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
     rows = []
     for _, row in df_in.iterrows():
         text_orig = row.get(text_col, "")
@@ -446,7 +453,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, use_llm: bool):
 
         # Find qualifying sentences & regex matches
         hba_matches, hba_sentences = extract_sentences(text_orig)
-        sentences_joined = " | ".join(hba_sentences) if hba_sentences else ""
+        shortlisted = " | ".join(hba_sentences) if hba_sentences else ""
 
         # Precomputed relative from-to if available
         def _find_precomputed_relative(matches):
@@ -493,11 +500,11 @@ def process_df(df_in: pd.DataFrame, text_col: str, use_llm: bool):
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
 
-        # LLM extraction (if enabled, reads only qualifying sentences + full abstract for duration)
+        # LLM extraction (if enabled, reads only shortlisted sentences + full abstract for duration)
         llm_extracted, llm_selected, llm_duration = [], "", ""
-        if use_llm and model is not None and sentences_joined:
+        if use_llm and model is not None and shortlisted:
             llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(
-                model, sentences_joined, text_orig
+                model, shortlisted, text_orig
             )
 
         # Final duration: prefer LLM duration; else regex
@@ -525,7 +532,8 @@ def process_df(df_in: pd.DataFrame, text_col: str, use_llm: bool):
         new = row.to_dict()
         new.update(
             {
-                "sentence": sentences_joined,
+                "shortlisted_sentences": shortlisted,
+                "sentence": shortlisted,  # keep for debug compatibility
                 "extracted_matches": hba_regex_vals,
                 "LLM extracted": llm_extracted,
                 "selected %": selected,
@@ -541,12 +549,16 @@ def process_df(df_in: pd.DataFrame, text_col: str, use_llm: bool):
     def has_items(x):
         return isinstance(x, list) and len(x) > 0
 
-    mask = (out["sentence"].astype(str).str.len() > 0) & (
-        out["extracted_matches"].apply(has_items)
-        | out["LLM extracted"].apply(has_items)
-    )
-    out = out[mask].reset_index(drop=True)
-    out.attrs["counts"] = dict(kept=int(mask.sum()), total=int(len(out)))
+    if not out.empty:
+        mask = (out["shortlisted_sentences"].astype(str).str.len() > 0) & (
+            out["extracted_matches"].apply(has_items)
+            | out["LLM extracted"].apply(has_items)
+        )
+        out = out[mask].reset_index(drop=True)
+        out.attrs["counts"] = dict(kept=int(mask.sum()), total=int(len(mask)))
+    else:
+        out.attrs["counts"] = dict(kept=0, total=0)
+
     return out
 
 # -------------------- UI --------------------
@@ -559,7 +571,7 @@ uploaded = st.sidebar.file_uploader(
 )
 col_name = st.sidebar.text_input("Column with abstracts/text", value="abstract")
 show_debug = st.sidebar.checkbox(
-    "Show debug columns (extracted_matches, LLM extracted, sentence)", value=True
+    "Show extra debug columns (extracted_matches, LLM extracted, sentence)", value=False
 )
 
 if not uploaded:
@@ -582,7 +594,7 @@ if col_name not in df.columns:
     st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
     st.stop()
 
-# Configure LLM model (global variable)
+# Configure LLM model (global)
 model = None
 if use_llm:
     if not GENAI_AVAILABLE:
@@ -601,13 +613,13 @@ if use_llm:
 
 st.success(f"Loaded {len(df)} rows. Processing...")
 
-out_df = process_df(df, col_name, use_llm)
+out_df = process_df(df, col_name, model, use_llm)
 
-# Ensure duration is last column
+# Ensure 'duration' is the last column
 if "duration" in out_df.columns:
-    cols_no_duration = [c for c in out_df.columns if c != "duration"]
-    cols_no_duration.append("duration")
-    out_df = out_df[cols_no_duration]
+    cols = [c for c in out_df.columns if c != "duration"]
+    cols.append("duration")
+    out_df = out_df[cols]
 
 st.write("### Results (first 200 rows shown)")
 display_df = out_df.copy()
@@ -622,10 +634,9 @@ counts = out_df.attrs.get("counts", None)
 if counts:
     kept = counts.get("kept", 0)
     total = counts.get("total", 0)
-    st.caption(f"Kept {kept} rows with A1c extraction (from {total} processed rows).")
+    st.caption(f"Kept {kept} rows with A1c extraction (from {total} rows).")
 
 # -------------------- Download --------------------
-@st.cache_data
 def to_excel_bytes(df_out):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
