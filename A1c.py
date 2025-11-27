@@ -6,7 +6,7 @@ Logic:
 1. Regex finds ONLY sentences that:
    - Mention A1c / HbA1c / Hb A1c
    - Contain a reduction cue (reduce/decrease/decline/fell/...)
-   - Contain a number followed by '%'
+   - Contain a number with '%'
 2. These shortlisted sentences are sent to the LLM.
 3. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
 4. LLM also reads the FULL ABSTRACT to find duration.
@@ -326,26 +326,11 @@ Return exactly ONE JSON object and NO extra text.
 
 Allowed keys:
 {
-  "extracted": ["1.75%", "1.35%", "0.4%"],   // array of candidate percent magnitudes (strings, may be empty)
-  "selected_percent": "1.75%",               // OPTIONAL: best single percent reduction (positive, with %)
-  "duration": "6 months",                    // OPTIONAL: duration/timepoint (e.g., "T12", "12 months", "26 weeks")
-  "confidence": 0.9                          // OPTIONAL: confidence (0.0 - 1.0)
+  "extracted": ["1.75%", "1.35%", "0.4%"],
+  "selected_percent": "1.75%",
+  "duration": "6 months",
+  "confidence": 0.9
 }
-
-Rules:
-- Percent strings:
-  - Represent *change magnitudes* in A1c/HbA1c, NOT thresholds or goals.
-  - You may return them in natural language, e.g. "A1c reduction of 1.7%".
-- Duration:
-  - Human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
-  - If multiple timepoints, pick the one most clearly tied to the main A1c result (prefer 12 months/T12 over 6 months/T6 when ambiguous).
-- From phrases like "from 8.0% to 6.0%":
-  - You may compute relative reduction ((8 - 6) / 6 * 100) and include it as a candidate.
-- Ignore:
-  - thresholds like ">=5%" or "HbA1c <7.0%",
-  - sample-size percentages,
-  - p-values, confidence intervals, etc.
-- Output must be STRICT JSON and parseable.
 """
 
 def configure_gemini(api_key: str):
@@ -353,10 +338,43 @@ def configure_gemini(api_key: str):
         return None
     try:
         genai.configure(api_key=api_key)
+        # note: adjust model name if your library expects "models/gemini-2.0-flash"
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
 
+# -------- robust response text extractor --------
+LLM_DEBUG_SHOWN = False
+
+def get_resp_text(resp):
+    """
+    Try multiple ways to extract text from a google.generativeai response.
+    """
+    # 1) Direct .text (newer versions)
+    txt = getattr(resp, "text", None)
+    if isinstance(txt, str) and txt.strip():
+        return txt
+
+    # 2) candidates[0].content.parts[*].text style
+    try:
+        if hasattr(resp, "candidates") and resp.candidates:
+            parts = resp.candidates[0].content.parts
+            chunks = []
+            for p in parts:
+                # p.text for text parts
+                t = getattr(p, "text", None)
+                if isinstance(t, str):
+                    chunks.append(t)
+            if chunks:
+                return "\n".join(chunks)
+    except Exception:
+        pass
+
+    # 3) fallback: string representation
+    try:
+        return str(resp)
+    except Exception:
+        return ""
 
 def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
     """
@@ -365,6 +383,8 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
       - full abstract for duration
     Returns (extracted_list, selected_percent, duration_str).
     """
+    global LLM_DEBUG_SHOWN
+
     if (
         model is None
         or not a1c_sentences
@@ -386,9 +406,17 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
 
     try:
         resp = model.generate_content(prompt)
-        text = (getattr(resp, "text", "") or "").strip()
+        text = get_resp_text(resp).strip()
+
+        # show raw LLM output once for debugging
+        if not LLM_DEBUG_SHOWN:
+            with st.expander("LLM raw output (first call)"):
+                st.write(text)
+            LLM_DEBUG_SHOWN = True
+
         s, e = text.find("{"), text.rfind("}")
         if s == -1 or e <= s:
+            # no JSON found at all
             return [], "", ""
 
         data = json.loads(text[s : e + 1])
@@ -421,7 +449,8 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
 
         return extracted, selected, duration
 
-    except Exception:
+    except Exception as e:
+        st.error(f"Gemini LLM call failed: {e}")
         return [], "", ""
 
 # -------------------- Scoring --------------------
@@ -494,7 +523,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
             t = (m.get("type") or "").lower()
             if "from-to" in t:
                 if "relative" in t:
-                    vals = m.get("values") or []
+                    vals = (m.get("values") or [])
                     if len(vals) >= 3 and vals[2] is not None and not math.isnan(vals[2]):
                         return fmt_pct(vals[2])
                     if m.get("reduction_pp") is not None and not math.isnan(m.get("reduction_pp")):
@@ -560,7 +589,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
                 "shortlisted_sentences": shortlisted,
                 "sentence": shortlisted,  # debug compatibility
                 "extracted_matches": hba_regex_vals,
-                "LLM extracted": llm_extracted,  # debug list
+                "LLM extracted": llm_extracted,  # debug list (list in app; string in Excel)
                 "A1c reduction values": a1c_reduction_values_str,
                 "selected %": selected,
                 "A1c Score": a1c_score,
