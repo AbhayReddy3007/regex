@@ -7,14 +7,15 @@ Logic:
    - Mention A1c / HbA1c / Hb A1c
    - Contain a reduction cue (reduce/decrease/decline/fell/...)
    - Contain a number followed by '%'
-2. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
-3. LLM also reads the FULL ABSTRACT to find duration.
-4. Among available values, it selects the best A1c value and a score is assigned.
+2. These shortlisted sentences are sent to the LLM.
+3. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
+4. LLM also reads the FULL ABSTRACT to find duration.
+5. Among available values, it selects the best A1c value and a score is assigned.
 
 Columns:
 - shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
 - A1c reduction values: ALL A1c reduction values extracted by the LLM (joined with " | ")
-- selected %: chosen A1c reduction
+- selected %: chosen A1c reduction (LLM-preferred, regex fallback)
 - A1c Score: score based on selected %
 - duration: trial/timepoint duration (LLM preferred, regex fallback)
 
@@ -152,7 +153,7 @@ def window_prev_next_spaces_inclusive_tokens(
         else:
             i -= 1
     j = left_boundary_start - 1
-    while j >= 0 and s[j] not in space_like:
+    while j >= 0 and j < len(s) and s[j] not in space_like:
         j -= 1
     start = j + 1
 
@@ -307,14 +308,16 @@ def extract_sentences(text: str):
 LLM_RULES = r"""
 You are an extraction assistant.
 
-IMPORTANT: Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same measurement (they are synonyms).
+IMPORTANT:
+- Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same measurement (they are synonyms).
+- Focus ONLY on reductions/changes in A1c/HbA1c, not on thresholds, goals, or target values.
 
 INPUT:
 - SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c, a reduction cue, and contain a percent.
 - FULL_ABSTRACT_FOR_DURATION: the entire abstract text.
 
 TASKS:
-1) From SENTENCES_FOR_A1C, extract all HbA1c/A1c change magnitudes (percent reductions), and choose the best single value.
+1) From SENTENCES_FOR_A1C, extract all A1c/HbA1c change magnitudes (percent reductions), and choose the best single value.
 2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
 
 Return exactly ONE JSON object and NO extra text.
@@ -329,9 +332,8 @@ Allowed keys:
 
 Rules:
 - Percent strings:
-  - Must use '.' as decimal separator.
-  - Must end with '%', e.g., "1.75%".
   - Represent *change magnitudes* in A1c/HbA1c, NOT thresholds or goals.
+  - You may return them in natural language, e.g. "A1c reduction of 1.7%".
 - Duration:
   - Human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
   - If multiple timepoints, pick the one most clearly tied to the main A1c result (prefer 12 months/T12 over 6 months/T6 when ambiguous).
@@ -355,17 +357,14 @@ def configure_gemini(api_key: str):
 
 
 def _norm_percent(v: str) -> str:
-    v = (v or "").strip().replace(" ", "")
-    if v and not v.endswith("%"):
-        if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
-            v += "%"
+    v = (v or "").strip()
     return v
 
 
 def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
     """
     LLM reads:
-      - only qualifying sentences for A1c values
+      - shortlisted sentences for A1c values
       - full abstract for duration
     Returns (extracted_list, selected_percent, duration_str).
     """
@@ -392,30 +391,41 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
         resp = model.generate_content(prompt)
         text = (getattr(resp, "text", "") or "").strip()
         s, e = text.find("{"), text.rfind("}")
-        if s != -1 and e > s:
-            data = json.loads(text[s : e + 1])
-            extracted = []
-            for x in (data.get("extracted") or []):
-                if not isinstance(x, str):
-                    continue
-                x2 = _norm_percent(x)
-                if re.match(r"^[+-]?\d+(?:[.,·]\d+)?%$", x2):
-                    n = parse_number(x2.replace("%", ""))
-                    if not math.isnan(n):
-                        extracted.append(fmt_pct(abs(n)))
-            selected = _norm_percent(data.get("selected_percent", "") or "")
-            if selected:
-                try:
-                    n = parse_number(selected.replace("%", ""))
-                    if not math.isnan(n):
-                        selected = fmt_pct(abs(n))
-                except Exception:
-                    selected = ""
-            duration = (data.get("duration") or "").strip()
-            return extracted, selected, duration
+        if s == -1 or e <= s:
+            return [], "", ""
+
+        data = json.loads(text[s : e + 1])
+
+        extracted = []
+        # ---- tolerant parsing: pull numbers (with or without %) from any strings ----
+        for x in (data.get("extracted") or []):
+            if not isinstance(x, str):
+                continue
+            m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)\s*%?', x)
+            if not m:
+                continue
+            num = parse_number(m.group(1))
+            if math.isnan(num):
+                continue
+            extracted.append(fmt_pct(abs(num)))
+
+        selected = ""
+        selected_raw = data.get("selected_percent", "") or ""
+        if isinstance(selected_raw, str) and selected_raw.strip():
+            m = re.search(r'([+-]?\d+(?:[.,·]\d+)?)\s*%?', selected_raw)
+            if m:
+                num = parse_number(m.group(1))
+                if not math.isnan(num):
+                    selected = fmt_pct(abs(num))
+
+        duration = ""
+        if isinstance(data.get("duration"), str):
+            duration = data.get("duration").strip()
+
+        return extracted, selected, duration
+
     except Exception:
         return [], "", ""
-    return [], "", ""
 
 # -------------------- Scoring --------------------
 def compute_a1c_score(selected_pct_str: str):
@@ -505,7 +515,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
 
-        # LLM extraction (if enabled, reads only shortlisted sentences + full abstract for duration)
+        # LLM extraction (reads only shortlisted sentences + full abstract for duration)
         llm_extracted, llm_selected, llm_duration = [], "", ""
         if use_llm and model is not None and shortlisted:
             llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(
