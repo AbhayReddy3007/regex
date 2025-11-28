@@ -13,7 +13,10 @@ Logic:
        ((X - Y) / X) * 100
    and includes this as a candidate and (by default) selects it as the main A1c reduction.
 5. LLM also reads the FULL ABSTRACT to find duration.
-6. Among available values, it selects the best A1c value and a score is assigned.
+6. LLM receives an optional DRUG_HINT (from a drug-name column):
+   - It must only extract reductions clearly associated with that drug.
+   - It must ignore pure between-group differences (e.g. "mean difference -0.35%").
+7. Among available values, it selects the best A1c value and a score is assigned.
 
 Columns:
 - shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
@@ -24,7 +27,8 @@ Columns:
     - Otherwise: LLM selected %, then regex relative, then regex first %.
 - A1c Score: score based on selected %
 - duration: trial/timepoint duration (LLM preferred, regex fallback)
-- LLM_status: shows whether LLM ran and returned something (OK / NO OUTPUT / DISABLED / NO SENTENCES)
+- LLM_status: LLM state per row
+- Optional drug column used as DRUG_HINT for LLM
 
 Usage:
     # set your key in environment (recommended)
@@ -325,24 +329,44 @@ You are an extraction assistant.
 IMPORTANT:
 - Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same measurement (they are synonyms).
 - Focus ONLY on reductions/changes in A1c/HbA1c, not on thresholds, goals, or target values.
+- You will also receive an optional DRUG_HINT. Use it to link values to a specific drug/group.
 
 INPUT:
+- DRUG_HINT: a string with the target drug/regimen name (may be empty).
 - SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c, a reduction cue, and contain a percent.
 - FULL_ABSTRACT_FOR_DURATION: the entire abstract text.
 
 TASKS:
 1) From SENTENCES_FOR_A1C, extract all A1c/HbA1c change magnitudes (percent reductions), and choose the best single value.
    - Include:
-     • group-specific reductions (e.g., "1.75% in oral semaglutide"),
-     • between-group differences (e.g., "0.4% greater reduction"),
-     • and relative reductions computed from 'from X% to Y%' patterns (see special rule).
+     • group-specific reductions (e.g., "1.75% in the oral semaglutide group"),
+     • relative reductions computed from 'from X% to Y%' patterns (see special rule).
+   - EXCLUDE:
+     • values that represent ONLY between-group differences such as "difference", "mean difference",
+       "treatment difference", or "greater than" comparisons between two drugs.
+       Example: "HbA1c reduction was significantly greater with oral semaglutide than with empagliflozin
+       (mean difference -0.35%, p<0.001)" → do NOT extract "-0.35%" as an A1c reduction.
 2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
+
+DRUG LINKING RULE:
+- If DRUG_HINT is NON-EMPTY:
+  - You must only extract A1c reduction magnitudes that can be clearly linked to that drug/regimen.
+  - Look for explicit associations such as:
+       "in the DRUG_HINT group", "patients on DRUG_HINT had a reduction of 1.5%", "DRUG_HINT reduced HbA1c by 1.5%".
+  - Ignore changes clearly tied to other drugs or control groups.
+  - Ignore pure between-group differences (e.g., "mean difference -0.35% between DRUG_HINT and comparator").
+  - If you cannot confidently tie any valid A1c reduction to DRUG_HINT, return:
+       "extracted": []
+       and omit selected_percent (or leave it empty).
+- If DRUG_HINT is EMPTY:
+  - You may extract A1c reductions for any clearly defined arm, but still must ignore pure between-group
+    "difference" values.
 
 Return exactly ONE JSON object and NO extra text.
 
 Allowed keys:
 {
-  "extracted": ["1.75%", "1.35%", "0.4%", "25.0%"],
+  "extracted": ["1.75%", "1.35%", "25.0%"],
   "selected_percent": "25.0%",
   "duration": "6 months",
   "confidence": 0.9
@@ -355,6 +379,8 @@ Rules for A1c reductions:
   - thresholds like ">=5%" or "HbA1c <7.0%",
   - sample-size percentages,
   - p-values, confidence intervals, etc.
+- Also ignore pure between-group differences such as:
+  - "difference -0.35%", "mean difference -0.35%", "treatment difference 0.3%" etc.
 
 SPECIAL RULE: 'from X% to Y%' PATTERNS
 - When you see a phrase like "HbA1c decreased from X% to Y%" or "reduced from X% to Y%":
@@ -363,7 +389,7 @@ SPECIAL RULE: 'from X% to Y%' PATTERNS
      (Use X in the denominator, NOT Y.)
   2) Normalize and round to a reasonable number of decimals (e.g., "25.0%").
   3) Add this relative reduction to the `extracted` array.
-  4) **By default, set `selected_percent` to this relative reduction**, unless there is a clearly more important A1c reduction value mentioned.
+  4) **By default, set `selected_percent` to this relative reduction**, unless there is a clearly more important A1c reduction value for the DRUG_HINT.
 
 Duration rule:
 - Duration must be human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
@@ -406,11 +432,12 @@ def get_resp_text(resp):
     except Exception:
         return ""
 
-def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
+def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, drug_hint: str = ""):
     """
     LLM reads:
       - shortlisted sentences for A1c values
       - full abstract for duration
+      - optional drug hint
     Returns (extracted_list, selected_percent, duration_str).
     """
     global LLM_DEBUG_SHOWN
@@ -424,8 +451,15 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
     ):
         return [], "", ""
 
+    header = ""
+    if drug_hint:
+        header += f"DRUG_HINT: {drug_hint}\n"
+    else:
+        header += "DRUG_HINT: \n"
+
     prompt = (
-        "SENTENCES_FOR_A1C:\n"
+        header
+        + "SENTENCES_FOR_A1C:\n"
         + a1c_sentences
         + "\n\nFULL_ABSTRACT_FOR_DURATION:\n"
         + full_abstract
@@ -509,12 +543,17 @@ def compute_a1c_score(selected_pct_str: str):
     return ""
 
 # -------------------- Processing --------------------
-def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
+def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_col_name: str | None):
     rows = []
     for _, row in df_in.iterrows():
         text_orig = row.get(text_col, "")
         if not isinstance(text_orig, str):
             text_orig = "" if pd.isna(text_orig) else str(text_orig)
+
+        # Drug hint per row
+        drug_hint = ""
+        if drug_col_name and drug_col_name in df_in.columns:
+            drug_hint = str(row.get(drug_col_name, "") or "")
 
         duration_regex = extract_durations_regex(text_orig)
 
@@ -567,7 +606,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         llm_extracted, llm_selected, llm_duration = [], "", ""
         if use_llm and model is not None and shortlisted:
             llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(
-                model, shortlisted, text_orig
+                model, shortlisted, text_orig, drug_hint
             )
 
         if not use_llm or model is None:
@@ -585,7 +624,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         # A1c reduction values string (LLM only)
         a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
 
-        # NEW RULE 1: if no A1c reduction values from LLM → selected % must be empty
+        # RULE: if no A1c reduction values from LLM → selected % must be empty (no regex fallback)
         if not llm_extracted:
             selected = ""
         else:
@@ -666,6 +705,9 @@ uploaded = st.sidebar.file_uploader(
     "Upload Excel (.xlsx) or CSV", type=["xlsx", "xls", "csv"]
 )
 col_name = st.sidebar.text_input("Column with abstracts/text", value="abstract")
+drug_col_name = st.sidebar.text_input(
+    "Column with drug name (optional, for DRUG_HINT)", value="drug_name"
+)
 show_debug = st.sidebar.checkbox(
     "Show extra debug columns (extracted_matches, LLM extracted, sentence)", value=False
 )
@@ -690,6 +732,16 @@ if col_name not in df.columns:
     st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
     st.stop()
 
+# if user typed a drug column that doesn't exist, ignore hint and warn
+if drug_col_name and drug_col_name not in df.columns:
+    st.warning(
+        f'Drug column "{drug_col_name}" not found in data. '
+        "Drug-based extraction will be skipped."
+    )
+    effective_drug_col = None
+else:
+    effective_drug_col = drug_col_name if drug_col_name in df.columns else None
+
 model = None
 if use_llm:
     if not GENAI_AVAILABLE:
@@ -708,7 +760,7 @@ if use_llm:
 
 st.success(f"Loaded {len(df)} rows. Processing...")
 
-out_df = process_df(df, col_name, model, use_llm)
+out_df = process_df(df, col_name, model, use_llm, effective_drug_col)
 
 if "duration" in out_df.columns:
     cols = [c for c in out_df.columns if c != "duration"]
