@@ -119,3 +119,6 @@ Return EXACTLY a single JSON object and nothing else, with these keys:
 END OF RULES
 """
 
+HbA1c reduction was significantly greater with oral semaglutide than with empagliflozin (mean difference - 0.35%, p <0.001).
+
+
