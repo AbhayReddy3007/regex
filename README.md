@@ -1,3 +1,5 @@
+The proportion of subjects with any decrease in HbA1c was higher among the once-weekly compared with the daily dose (82.4% vs.
+
 Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% (P< 0.001) and -3.64 kg (P= 0.015), respectively, in the oral semaglutide group and -1.35% (P< 0.001) and -5.26 kg (P< 0.001), respectively, in the injectable semaglutide group. | When directly comparing semaglutide formulations, oral semaglutide demonstrated a 0.4% greater numerical reduction in HbA1C(P= 0.523) and injectable semaglutide demonstrated a 1.62-kg greater numerical reduction in weight (P= 0.312).
 
 Patients experienced mean decreases in HbA1C and weight from baseline to 6 months of -1.75% (P< 0.001) and -3.64 kg (P= 0.015), respectively, in the oral semaglutide group and -1.35% (P< 0.001) and -5.26 kg (P< 0.001), respectively, in the injectable semaglutide group.
