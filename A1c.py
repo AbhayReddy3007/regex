@@ -18,8 +18,10 @@ Logic:
 Columns:
 - shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
 - A1c reduction values: ALL A1c reduction values extracted by the LLM (joined with " | ")
-- selected %: chosen A1c reduction (LLM-preferred, regex fallback), BUT:
-      If all A1c reduction values from the LLM are 0 → selected % is forced to 0%.
+- selected %:
+    - If A1c reduction values (LLM) are empty → selected % is empty.
+    - If all A1c reduction values are 0 → selected % = 0%.
+    - Otherwise: LLM selected %, then regex relative, then regex first %.
 - A1c Score: score based on selected %
 - duration: trial/timepoint duration (LLM preferred, regex fallback)
 - LLM_status: shows whether LLM ran and returned something (OK / NO OUTPUT / DISABLED / NO SENTENCES)
@@ -43,7 +45,6 @@ import pandas as pd
 import streamlit as st
 
 # ===================== GEMINI KEY (from environment) =====================
-# Set GEMINI_API_KEY in your OS environment before running Streamlit.
 API_KEY = os.getenv("GEMINI_API_KEY", "")
 # ========================================================================
 
@@ -377,24 +378,17 @@ def configure_gemini(api_key: str):
         return None
     try:
         genai.configure(api_key=api_key)
-        # adjust model name if your client expects "models/gemini-2.0-flash"
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
 
-# -------- robust response text extractor --------
 LLM_DEBUG_SHOWN = False
 
 def get_resp_text(resp):
-    """
-    Try multiple ways to extract text from a google.generativeai response.
-    """
-    # 1) Direct .text (newer versions)
+    """Try multiple ways to extract text from a google.generativeai response."""
     txt = getattr(resp, "text", None)
     if isinstance(txt, str) and txt.strip():
         return txt
-
-    # 2) candidates[0].content.parts[*].text style
     try:
         if hasattr(resp, "candidates") and resp.candidates:
             parts = resp.candidates[0].content.parts
@@ -407,8 +401,6 @@ def get_resp_text(resp):
                 return "\n".join(chunks)
     except Exception:
         pass
-
-    # 3) fallback: string representation
     try:
         return str(resp)
     except Exception:
@@ -446,7 +438,6 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
         resp = model.generate_content(prompt)
         text = get_resp_text(resp).strip()
 
-        # show raw LLM output once for debugging
         if not LLM_DEBUG_SHOWN:
             with st.expander("LLM raw output (first call)"):
                 st.write(text)
@@ -454,13 +445,11 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str):
 
         s, e = text.find("{"), text.rfind("}")
         if s == -1 or e <= s:
-            # no JSON found at all
             return [], "", ""
 
         data = json.loads(text[s : e + 1])
 
         extracted = []
-        # tolerant parsing: pull numbers (with or without %) from any strings
         for x in (data.get("extracted") or []):
             if not isinstance(x, str):
                 continue
@@ -527,14 +516,11 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         if not isinstance(text_orig, str):
             text_orig = "" if pd.isna(text_orig) else str(text_orig)
 
-        # Regex duration fallback
         duration_regex = extract_durations_regex(text_orig)
 
-        # Find qualifying sentences & regex matches
         hba_matches, hba_sentences = extract_sentences(text_orig)
         shortlisted = " | ".join(hba_sentences) if hba_sentences else ""
 
-        # Precomputed relative from-to if available (REL = ((X - Y) / X) * 100)
         def _find_precomputed_relative(matches):
             for m in matches:
                 t = (m.get("type") or "").lower()
@@ -556,7 +542,6 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
         precomputed_rel = _find_precomputed_relative(hba_matches)
 
-        # Format regex outputs
         def fmt_extracted(m):
             t = (m.get("type") or "").lower()
             if "from-to" in t:
@@ -579,14 +564,12 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
 
-        # LLM extraction (reads only shortlisted sentences + full abstract for duration)
         llm_extracted, llm_selected, llm_duration = [], "", ""
         if use_llm and model is not None and shortlisted:
             llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(
                 model, shortlisted, text_orig
             )
 
-        # Determine LLM_status for this row
         if not use_llm or model is None:
             llm_status = "LLM DISABLED"
         elif not shortlisted:
@@ -596,12 +579,18 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
         else:
             llm_status = "LLM OK"
 
-        # Final duration: prefer LLM duration; else regex
         final_duration = llm_duration if llm_duration else duration_regex
 
-        # -------- NEW RULE: if A1c reduction values from LLM are all 0 -> selected % = 0% --------
-        all_llm_zero = False
-        if llm_extracted:
+        # --------- A1c reduction values and selection logic ---------
+        # A1c reduction values string (LLM only)
+        a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
+
+        # NEW RULE 1: if no A1c reduction values from LLM → selected % must be empty
+        if not llm_extracted:
+            selected = ""
+        else:
+            # Check if all LLM values are zero
+            all_llm_zero = False
             nums = []
             for item in llm_extracted:
                 if isinstance(item, str):
@@ -613,38 +602,35 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
             if nums and all(v == 0 for v in nums):
                 all_llm_zero = True
 
-        # Selected percent: apply your rule first, then normal precedence
-        if all_llm_zero:
-            selected = fmt_pct(0.0)  # force 0%
-        else:
-            selected = ""
-            if llm_selected:
-                selected = llm_selected
-            elif precomputed_rel:
-                selected = precomputed_rel
+            if all_llm_zero:
+                selected = fmt_pct(0.0)
             else:
-                for it in hba_regex_vals:
-                    if isinstance(it, str) and it.strip().endswith("%"):
-                        s2 = it.replace("%", "").replace(",", ".").strip()
-                        try:
-                            v = float(s2)
-                            selected = fmt_pct(abs(v))
-                            break
-                        except Exception:
-                            continue
+                selected = ""
+                if llm_selected:
+                    selected = llm_selected
+                elif precomputed_rel:
+                    selected = precomputed_rel
+                else:
+                    for it in hba_regex_vals:
+                        if isinstance(it, str) and it.strip().endswith("%"):
+                            s2 = it.replace("%", "").replace(",", ".").strip()
+                            try:
+                                v = float(s2)
+                                selected = fmt_pct(abs(v))
+                                break
+                            except Exception:
+                                continue
+        # -----------------------------------------------------------
 
         a1c_score = compute_a1c_score(selected)
-
-        # Column: all LLM A1c reduction values as a single string
-        a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
 
         new = row.to_dict()
         new.update(
             {
                 "shortlisted_sentences": shortlisted,
-                "sentence": shortlisted,  # debug compatibility
+                "sentence": shortlisted,
                 "extracted_matches": hba_regex_vals,
-                "LLM extracted": llm_extracted,  # debug list
+                "LLM extracted": llm_extracted,
                 "A1c reduction values": a1c_reduction_values_str,
                 "selected %": selected,
                 "A1c Score": a1c_score,
@@ -656,7 +642,6 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool):
 
     out = pd.DataFrame(rows)
 
-    # Keep rows that actually have extraction
     def has_items(x):
         return isinstance(x, list) and len(x) > 0
 
@@ -705,7 +690,6 @@ if col_name not in df.columns:
     st.error(f'Column "{col_name}" not found. Available columns: {list(df.columns)}')
     st.stop()
 
-# Configure LLM model (global)
 model = None
 if use_llm:
     if not GENAI_AVAILABLE:
@@ -726,7 +710,6 @@ st.success(f"Loaded {len(df)} rows. Processing...")
 
 out_df = process_df(df, col_name, model, use_llm)
 
-# Ensure 'duration' is the last column
 if "duration" in out_df.columns:
     cols = [c for c in out_df.columns if c != "duration"]
     cols.append("duration")
@@ -735,14 +718,12 @@ if "duration" in out_df.columns:
 st.write("### Results (first 200 rows shown)")
 display_df = out_df.copy()
 if not show_debug:
-    # Hide only debug columns, keep "A1c reduction values" & "LLM_status" visible
     for c in ["extracted_matches", "LLM extracted", "sentence"]:
         if c in display_df.columns:
             display_df = display_df.drop(columns=[c])
 
 st.dataframe(display_df.head(200))
 
-# Global LLM-status message
 if use_llm and not out_df.empty:
     if (display_df["LLM_status"] == "LLM OK").sum() == 0:
         st.error("LLM seems to be enabled but did not return any usable output for any row.")
@@ -753,7 +734,6 @@ if counts:
     total = counts.get("total", 0)
     st.caption(f"Kept {kept} rows with A1c extraction (from {total} rows).")
 
-# -------------------- Download --------------------
 def to_excel_bytes(df_out):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
