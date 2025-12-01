@@ -22,7 +22,7 @@ Key rules:
    - Ignore baseline / target A1c values.
    - Ignore pure between-group "difference" values (e.g., mean difference -0.35%).
 
-5. VERY IMPORTANT POST-FILTER:
+5. IMPORTANT POST-FILTER:
    Any % value produced by the LLM that does NOT literally appear as a % in the
    shortlisted sentences is discarded.
    → Relative reductions like 25% hallucinated by the LLM are dropped.
@@ -48,7 +48,6 @@ Columns:
 - selected %                 : chosen A1c reduction per rules above
 - A1c Score                  : numeric score from selected %
 - duration                   : LLM duration, or regex fallback
-- LLM_status                 : per-row status
 - (debug) extracted_matches, LLM extracted, sentence
 """
 
@@ -705,15 +704,6 @@ def process_df(
                 model, shortlisted, text_orig, drug_hint
             )
 
-        if not use_llm or model is None:
-            llm_status = "LLM DISABLED"
-        elif not shortlisted:
-            llm_status = "NO A1c SENTENCES"
-        elif not llm_extracted and not llm_selected and not llm_duration:
-            llm_status = "LLM NO OUTPUT"
-        else:
-            llm_status = "LLM OK"
-
         final_duration = llm_duration if llm_duration else duration_regex
 
         # A1c reduction values string (LLM only)
@@ -768,7 +758,6 @@ def process_df(
                 "selected %": selected,
                 "A1c Score": a1c_score,
                 "duration": final_duration,
-                "LLM_status": llm_status,
             }
         )
         rows.append(new)
@@ -870,10 +859,6 @@ if not show_debug:
 
 st.dataframe(display_df.head(200))
 
-if use_llm and not out_df.empty:
-    if (display_df["LLM_status"] == "LLM OK").sum() == 0:
-        st.error("LLM seems to be enabled but did not return any usable output for any row.")
-
 counts = out_df.attrs.get("counts", None)
 if counts:
     kept = counts.get("kept", 0)
@@ -894,3 +879,4 @@ st.download_button(
     file_name="a1c_results_with_llm_and_duration.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+
