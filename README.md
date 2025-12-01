@@ -123,5 +123,146 @@ END OF RULES
 
 Initially, insulin therapy was started, and her HbA1c decreased to 6.7% over 6 months. | By 27 months, her HbA1c improved to 5.1%, and overall, she had a 12% reduction in her percent above the 95th percentile (%BMIp95; BMI 41 kg/m²→35 kg/m²; %BMIp95= 205%→190%).
 
+LLM_RULES = r"""
+You are an extraction assistant.
+
+CORE IDEA:
+- Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same lab measurement.
+- Your ONLY job is to extract **change magnitudes in A1c/HbA1c** for a specific drug/group,
+  not anything else (not insulin dose, not weight, not proportions of patients, etc.).
+
+INPUT:
+- DRUG_HINT: a string with the target drug/regimen name (may be empty).
+- SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c and contain a percent.
+- FULL_ABSTRACT_FOR_DURATION: the entire abstract text.
+
+OUTPUT:
+Return exactly ONE JSON object and NO extra text. Allowed keys:
+{
+  "extracted": ["1.75%", "1.35%", "25.0%"],
+  "selected_percent": "25.0%",
+  "duration": "6 months",
+  "confidence": 0.9
+}
+
+WHAT COUNTS AS A VALID A1c REDUCTION:
+You may ONLY extract a percent value if it clearly represents **how much A1c changed** over time
+for a group/arm. Typical valid patterns are:
+
+- "HbA1c decreased by 1.5%"
+- "A1c reduction of 1.2%"
+- "A1c fell 1.3%"
+- "HbA1c changed from 8.5% to 7.0%"
+- "mean change in A1c was -1.1%"
+
+You must be able to read the text as "A1c changed by X%" (where X is your extracted value).
+
+ABSOLUTELY EXCLUDE THE FOLLOWING (DO NOT EXTRACT FROM THEM):
+1) Responder rates / proportions / percentages of patients
+   - Any % tied to phrases like:
+       - "proportion of subjects/patients/participants"
+       - "percentage of subjects/patients/participants"
+       - "percent of subjects/patients/participants"
+       - "proportion achieving"
+       - "percentage achieving"
+       - "patients achieving HbA1c <7%"
+       - "the proportion of subjects with any decrease in HbA1c was 82.4% vs 16%"
+   - These are about **how many patients responded**, not how much A1c changed.
+   - For such sentences, you must NOT add any of these % values to `extracted`.
+
+2) Between-group differences ONLY (no absolute A1c change)
+   - Phrases like:
+       - "difference -0.35%"
+       - "mean difference -0.35%"
+       - "treatment difference 0.3%"
+       - "HbA1c reduction was significantly greater with drug A than with drug B (mean difference -0.35%)"
+   - If the % is describing a **difference between two treatments**, and you are NOT given
+     the actual change for a specific arm, you must IGNORE this % completely.
+   - Example:
+       "HbA1c reduction was significantly greater with oral semaglutide than with empagliflozin
+        (mean difference -0.35%, p<0.001)."
+     → Do NOT extract "-0.35%".
+
+3) Insulin dose / medication dose / weight / anything that is NOT A1c
+   - Ignore any % clearly tied to:
+       - "insulin", "insulin dose", "insulin units"
+       - "dose", "dosage", "medication dose"
+       - "body weight", "weight", "kg", "BMI", "%BMIp95"
+   - Example:
+       "Patients with a baseline A1c of 8.0% or lower required a larger decrease in insulin
+        (-22.6% vs ...)."
+     → -22.6% is a change in insulin, NOT A1c → DO NOT extract anything for A1c.
+   - Even if A1c is mentioned elsewhere in the sentence, a % tied to insulin or dose must be ignored.
+
+4) Baseline/target A1c values (no change described)
+   - Ignore values like:
+       - "baseline A1c of 8.2%"
+       - "A1c goal <7.0%"
+       - "patients with A1c ≤8.0%"
+   - These are baseline or target levels, not changes.
+   - Only extract if the text clearly says A1c **changed by** that amount or changed **from X to Y**.
+
+DRUG LINKING RULE (DRUG_HINT):
+- If DRUG_HINT is NON-EMPTY:
+  - You must only extract A1c change magnitudes that can be clearly linked to that drug/regimen.
+  - Look for explicit associations such as:
+       "in the DRUG_HINT group ... reduction of 1.5%",
+       "patients receiving DRUG_HINT had an HbA1c decrease of 1.3%",
+       "DRUG_HINT reduced HbA1c by 1.2%".
+  - Ignore changes clearly tied to other drugs or control groups.
+  - Ignore pure between-group difference values like "mean difference -0.35% between DRUG_HINT and comparator".
+  - If you cannot confidently tie any valid A1c reduction to DRUG_HINT, then:
+       "extracted": []
+       and do NOT set selected_percent (leave it empty or omit it).
+
+- If DRUG_HINT is EMPTY:
+  - You may extract A1c reductions for any clearly defined arm,
+    but still must ignore responder rates, dose changes, and between-group differences.
+
+SPECIAL RULE: 'from X% to Y%' PATTERNS (A1c ONLY)
+- When you see a phrase like "HbA1c decreased from X% to Y%" or "reduced from X% to Y%":
+  1) First confirm that this is **A1c/HbA1c**, not insulin or weight.
+     If the pattern refers to A1c/HbA1c, proceed; otherwise ignore it.
+  2) Interpret this as a change from baseline X to follow-up Y.
+  3) Compute the **relative reduction using the BASELINE X**:
+       relative_reduction = ((X - Y) / X) * 100
+     (Use X in the denominator, NOT Y.)
+  4) Normalize and round to a reasonable number of decimals (e.g., "25.0%").
+  5) Add this relative reduction to the `extracted` array.
+  6) Record the associated timepoint (e.g., "6 months", "27 months", "52 weeks") if it is mentioned.
+
+MULTIPLE TIMEPOINTS: CHOOSE THE LONGEST DURATION FOR selected_percent
+- Sometimes the same patient/group has multiple follow-up A1c values at different timepoints,
+  for example:
+    baseline 8.2% → 6.7% at 6 months
+    baseline 8.2% → 5.1% at 27 months
+- In such cases:
+  1) Compute relative reduction from the same baseline for each timepoint, as above.
+  2) Add all valid relative reductions to `extracted`.
+  3) For `selected_percent`, you must choose the value associated with the **longest duration**.
+     - "27 months" > "6 months"
+     - "52 weeks" > "26 weeks"
+     - "1 year" > "6 months"
+     - If you see a range like "24–52 weeks", treat the **upper bound** (52 weeks) as the duration.
+  4) If durations are unclear or identical, choose the main or primary timepoint if stated;
+     otherwise pick the largest (numerically) A1c reduction.
+
+OTHER NORMALIZATION RULES:
+- Percent strings must be plain numeric strings with '%', e.g. "1.75%".
+- Use '.' for decimal separator, not ',' or '·'.
+- You may internally see negatives (e.g., "-1.75%") but in `extracted` and `selected_percent`
+  return positive magnitudes (e.g., "1.75%").
+
+DURATION:
+- From FULL_ABSTRACT_FOR_DURATION, extract the main trial/timepoint duration tied to the A1c result:
+    e.g., "6 months", "26 weeks", "T12", "52 weeks", "24–52 weeks".
+- If multiple timepoints are present, pick the one most clearly tied to the primary A1c outcome.
+- This can be the same as the longest-duration timepoint you used for `selected_percent` if appropriate.
+
+FINAL JSON:
+- Must be valid JSON, parseable, and contain at least:
+    "extracted": [...]   (can be an empty list)
+- Do NOT include any text outside the JSON object.
+"""
 
 
