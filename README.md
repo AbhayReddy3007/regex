@@ -123,4 +123,6 @@ END OF RULES
 
 HbA1c reduction was significantly greater with oral semaglutide than with empagliflozin (mean difference - 0.35%, p <0.001).
 
+Patients with a baseline A1c of 8.0% or lower required a larger decrease in insulin compared to patients with a higher baseline A1c (-22.6% vs. | Conclusion:Patients require a reduction in insulin when transitioning from GLP-1 RAs to tirzepatide, especially if baseline A1c is less than or equal to 8.0%.
+
 
