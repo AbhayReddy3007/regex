@@ -1,4 +1,12 @@
 # streamlit_hba1c_weight_llm.py
+# Modified: LLM now reads full abstract (text column) and returns a selected duration.
+# Key changes:
+# - LLM_RULES extended to include `selected_duration` key and instructions on format.
+# - llm_extract_from_sentence now sends the FULL abstract (not just qualifying sentences) to the LLM
+#   and parses an optional `selected_duration` from the JSON returned by the LLM.
+# - process_df collects the returned selected_duration and places it in the output as
+#   'LLM selected duration'. If LLM doesn't provide a duration, we fall back to extract_durations().
+
 import re
 import math
 import json
@@ -354,18 +362,20 @@ def _norm_percent(v: str) -> str:
             v += "%"
     return v
 
-# -------------------- DETAILED LLM RULES --------------------
+# -------------------- DETAILED LLM RULES (extended with duration key) --------------------
 LLM_RULES = """
-You are a focused information-extraction assistant. Read the provided SENTENCE(S) and extract **change magnitudes** that represent reported changes for the specified TARGET (either "HbA1c"/"A1c" or "Body weight"). Return strict JSON only (no explanation, no commentary, no extra text). Follow these rules exactly.
+You are a focused information-extraction assistant. Read the provided FULL TEXT (abstract or sentence(s)) and extract **change magnitudes** that represent reported changes for the specified TARGET (either "HbA1c"/"A1c" or "Body weight") and — when present — the most relevant study DURATION for that change.
+Return strict JSON only (no explanation, no commentary, no extra text). Follow these rules exactly.
 
 OUTPUT SPECIFICATION (exact JSON structure)
 Return one JSON object. Allowed keys (you may include some or all as appropriate):
 {
-  "extracted": ["1.23%", "3.5 kg", "25.0% (relative)"],     // REQUIRED (array; may be empty). Include all plausible candidates you find in the sentence.
+  "extracted": ["1.23%", "3.5 kg", "25.0% (relative)"],     // REQUIRED (array; may be empty). Include all plausible candidates you find in the text.
   "selected_percent": "1.23%",                              // OPTIONAL: best percent value (absolute or relative) — positive magnitude, trailing '%'
   "selected_relative_percent": "25.0%",                     // OPTIONAL: the relative % computed from a `from X% to Y%` phrase ((X - Y) / Y * 100)
   "selected_kg": "3.5 kg",                                  // OPTIONAL: best kg value (absolute, positive, suffix ' kg')
-  "confidence": 0.92                                         // OPTIONAL: number 0.0–1.0 indicating your confidence (only if available)
+  "selected_duration": "12 months",                          // OPTIONAL: the duration most relevant to the selected change. Normalize common forms: 'T12', '12 months', '6 months', 'week 52', 'T6'
+  "confidence": 0.92                                           // OPTIONAL: number 0.0–1.0 indicating your confidence (only if available)
 }
 
 KEY PRINCIPLES (strict)
@@ -375,39 +385,34 @@ KEY PRINCIPLES (strict)
    - Decimal separators -> '.' (examples: '13·88' or '13,88' -> '13.88').
    - Percent strings MUST end with '%' and use '.' for decimals (e.g., "13.88%").
    - Kg strings MUST use the format "<number> kg" with a space and 'kg' suffix (e.g., "3.64 kg").
-   - Remove typographic artifacts and extra whitespace.
+   - Duration: prefer normalized forms such as 'T12', '12 months', '6 months', 'week 52', 'T6'.
 
 3) What to extract:
    - Extract only **change magnitudes** (reported reductions or increases) relevant to the TARGET.
    - Accept these forms (non-exhaustive): "reduced by 1.5%", "decrease of 1.2%", "13.88% body weight reduction", "mean decrease of 3.64 kg", "reduced by 3.5 kg", "from 8.5% to 7.0%".
-   - **Do NOT** extract thresholds, eligibility cutoffs or endpoints (examples: "≥5%", "HbA1c < 7.0%", "proportion achieving ≥5%"), SEs, CIs, p-values, sample-size percentages, or labels.
-   - If a percent appears in parentheses and is clearly an SE/CI (e.g., "(SE 0.90)"), do NOT extract it.
+   - **Do NOT** extract thresholds, eligibility cutoffs or endpoints (examples: ">=5%", "HbA1c < 7.0%", "proportion achieving >=5%"), SEs, CIs, p-values, sample-size percentages, or labels.
 
 4) `from X% to Y%` handling (absolute and relative):
    - When you detect a `from X% to Y%` pattern (or wording like "declined from X% to Y%"):
      a) Compute ABSOLUTE change in percentage points: `abs_pp = X - Y`.
      b) Compute RELATIVE reduction % using the formula: `((X - Y) / Y) * 100`.
         - Format as "N.N%" (dot decimal), round reasonably, include in `extracted` and set `selected_relative_percent` to this value if appropriate.
-   - Normalization: compute numerically, round to sensible precision (2–3 decimals ok), and format as "N.N%".
 
 5) Units to return:
    - Percent values: strings with '%' (e.g., "1.75%").
    - Kg values: strings with ' kg' suffix (e.g., "3.64 kg").
-   - Return both types if both are present in the sentence (so the app can decide which to prefer).
+   - Duration values: normalized tokens like '12 months', '6 months', 'T12', 'T6', 'week 52'.
 
 6) Drug context (`DRUG_HINT`):
    - You will be given an optional `DRUG_HINT` string. Use it to disambiguate when multiple drugs/groups are mentioned.
-   - Prefer values that are explicitly tied to the DRUG_HINT (e.g., "in the semaglutide group ... -1.75%").
-   - If you cannot confidently tie a value to the DRUG_HINT, include candidates in `extracted` and leave `selected_*` empty.
 
 7) Timepoint preference:
-   - If multiple timepoints are present (e.g., T12, 12-mo, week 52 vs T6 or week 26), prefer values at **12 months** (T12) over 6 months (T6) and unspecified ones. When selecting the best value, prefer T12 if applicable.
+   - If multiple timepoints are present (e.g., T12, 12-mo, week 52 vs T6 or week 26), prefer values at **12 months** (T12) over 6 months (T6) and unspecified ones when selecting the best value.
 
 8) Preference / selection rules (app-level guidance):
    - The app is configured to **prefer percent** for weight selection. So:
      • If a percent is present and clearly represents the weight change for the target/drug, set `selected_percent` to that percent (absolute magnitude, positive).
-     • If no suitable percent exists but a kg change is present & tied to the target/drug, set `selected_kg` to that kg and also include it in `extracted`. The app may convert kg → percent later using a baseline weight.
-   - Nevertheless, still return both percent and kg (if both exist) so the app has full context.
+     • If no suitable percent exists but a kg change is present & tied to the target/drug, set `selected_kg` to that kg and also include it in `extracted`.
 
 9) Sign handling:
    - If the sentence reports negative signs (e.g., "-3.5 kg", "-1.75%"), you may put negative values in `extracted` if you want, but **selected_*** fields must be positive absolute magnitudes (no leading '+' or '-') and must include units.
@@ -415,66 +420,49 @@ KEY PRINCIPLES (strict)
 10) Ambiguity & fallbacks:
    - If multiple plausible change values are present and you can confidently pick one for the DRUG_HINT and timepoint, set `selected_*` accordingly.
    - If ambiguous (cannot tie to DRUG_HINT or cannot decide), include all plausible candidates in `extracted` and leave all `selected_*` fields empty.
-   - If you cannot find any valid change magnitude, return `"extracted": []` and omit `selected_*` fields (or set them to empty strings).
 
 11) Output strictness & validations:
-   - JSON must parse. Allowed keys: `extracted` (required), `selected_percent` (optional), `selected_relative_percent` (optional), `selected_kg` (optional), `confidence` (optional).
-   - `extracted` must be an array (can be `[]`). Each element must be a string with appropriate unit (e.g., "1.23%", "3.64 kg", "25.0% (relative)").
-   - Do not print any extra commentary, logs, or explanation.
+   - JSON must parse. Allowed keys: `extracted` (required), `selected_percent` (optional), `selected_relative_percent` (optional), `selected_kg` (optional), `selected_duration` (optional), `confidence` (optional).
 
 12) Formatting & rounding:
    - Use dot decimal. Reasonable rounding: 1–3 decimal places (keep precision, but avoid unnecessary trailing zeros; e.g., "3.5 kg", "1.75%").
-   - For relative computations, 1–2 decimal places is fine (e.g., "25.0%").
 
 13) Examples (behavioral guidance — follow these examples exactly):
-   - Example A:
-       Sentence: "At week 36, semaglutide yielded a 13·88% (SE 0·90) body weight reduction compared with 0·42% ... (between-group difference: -13·46%)."
-       -> extracted should include "13.88%". You may include "13.46%" as additional candidate. selected_percent should be "13.88%".
-   - Example B:
-       Sentence: "Patients experienced mean decreases in HbA1c and weight from baseline to 6 months of -1.75% ... and -3.64 kg ... in the oral semaglutide group..."
-       DRUG_HINT: "semaglutide"
-       -> extracted should include "1.75%" and "3.64 kg"; selected_percent "1.75%" and selected_kg "3.64 kg" (if asked to pick both). If the app prefers percent, selected_percent must be set and used.
-   - Example C:
-       Sentence: "Declined from 8.0% to 6.0%."
-       -> absolute change = 2.0 pp; relative reduction = ((8 - 6)/6)*100 = 33.333...%. Include "33.333% (relative)" in extracted and set selected_relative_percent "33.33%" if that relative value is the best representative percent for the sentence.
-   - Example D:
-       Sentence: "Mean reduction: 3,5 kg (p<0.01)."
-       -> extracted should include "3.5 kg". Do NOT include "p<0.01" or anything related to p-value.
+   - Example: If abstract contains 'At 12 months, semaglutide yielded a 13·88% body weight reduction', set `selected_percent`: "13.88%" and `selected_duration`: "12 months".
 
 14) Edge-case rules:
    - If percent is attached to a threshold/target context (e.g., "proportion achieving ≥5%"), do NOT treat as a reduction.
-   - If you see ranges like "1.0–1.5%" and it refers to reduction magnitude, you may include the range (normalized) or include the max value as candidate — be conservative; if unsure, include both ends or both as separate entries like "1.0%","1.5%".
-   - If multiple drugs appear and DRUG_HINT is not provided, include candidates for all and leave selected_* empty.
 
-15) Confidence (optional):
-   - If you can compute a meaningful confidence (0–1) that the returned selected_* is correct, you may include `"confidence": <float>`.
 """
 
-def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
+
+def llm_extract_from_sentence(model, target_label: str, text: str, drug_hint: str = ""):
     """
-    Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_kg_or_rel (string))
+    Sends FULL text (abstract) to the LLM and parses JSON.
+    Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_duration_or_kg_or_rel (string))
     If model is None, returns ([], '', '')
     """
-    if model is None or not sentence.strip():
+    if model is None or not text.strip():
         return [], "", ""
 
     prompt = (
         f"TARGET: {target_label}\n"
         + (f"DRUG_HINT: {drug_hint}\n" if drug_hint else "")
         + LLM_RULES + "\n"
-        + "SENTENCE:\n" + sentence + "\n"
+        + "TEXT:\n" + text + "\n"
         + "Return JSON only.\n"
     )
 
     try:
         resp = model.generate_content(prompt)
-        text = (getattr(resp, "text", "") or "").strip()
+        text_out = (getattr(resp, "text", "") or "").strip()
         # find JSON object in response
-        s, e = text.find("{"), text.rfind("}")
+        s, e = text_out.find("{"), text_out.rfind("}")
         if s != -1 and e > s:
-            data = json.loads(text[s:e+1])
+            data = json.loads(text_out[s:e+1])
             extracted = []
             is_hba_target = str(target_label).strip().lower().startswith('hb')
+            # parse extracted candidates
             for x in (data.get("extracted") or []):
                 if not isinstance(x, str):
                     continue
@@ -498,6 +486,7 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
                     # Normalise percent and keep sign stripped for extracted (we keep candidate as-is)
                     extracted.append(_norm_percent(x2))
+
             # selected_percent if present
             selected = _norm_percent(data.get("selected_percent", "") or "")
             if selected:
@@ -509,6 +498,7 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 except:
                     selected = ""
 
+            # selected_kg handling
             selected_kg_or_rel = ""
             if 'selected_kg' in data and data.get('selected_kg'):
                 sk = (data.get('selected_kg') or "").strip()
@@ -518,13 +508,43 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                     if not math.isnan(num):
                         s_num = f"{num:.3f}".rstrip('0').rstrip('.')
                         selected_kg_or_rel = f"{s_num} kg"
-            # fallback: selected_relative_percent
+
+            # selected_relative_percent fallback
             if not selected_kg_or_rel and 'selected_relative_percent' in data and data.get('selected_relative_percent'):
                 sr = _norm_percent(data.get('selected_relative_percent') or "")
                 if sr:
                     selected_kg_or_rel = sr
 
-            return extracted, selected, selected_kg_or_rel
+            # selected_duration handling (new)
+            selected_duration = ""
+            if 'selected_duration' in data and data.get('selected_duration'):
+                sd = str(data.get('selected_duration') or "").strip()
+                # normalize some common forms using our extract_durations helper as guidance
+                # first try exact match of DURATION_RE
+                if DURATION_RE.search(sd):
+                    selected_duration = sd
+                else:
+                    # try to run extract_durations on the provided sd or the full text to get closer tokens
+                    ed = extract_durations(sd)
+                    if ed:
+                        selected_duration = ed.split(' | ')[0]
+                    else:
+                        selected_duration = sd
+
+            # if LLM did not provide duration, leave it empty — caller may fallback to regex-based extract_durations
+            # Return: extracted, selected_percent, selected_duration_or_kg_or_rel
+            # We keep the third slot compatible with existing code: for weight this may contain selected_kg or relative percent or duration
+            # To avoid breaking weight kg fallback logic, we return selected_kg_or_rel in third slot **and** provide selected_duration separately via a tuple extension
+            # But to keep minimal changes to downstream, we will pack selected_duration into the same third slot separated by ' ||| ' when both exist.
+
+            third_slot = selected_kg_or_rel
+            if selected_duration:
+                if third_slot:
+                    third_slot = f"{third_slot} ||| {selected_duration}"
+                else:
+                    third_slot = selected_duration
+
+            return extracted, selected, third_slot
     except Exception:
         return [], "", ""
 
@@ -653,20 +673,52 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         sentence_str = ' | '.join(hba_sentences) if hba_sentences else ''
         weight_sentence_str = ' | '.join(wt_sentences) if wt_sentences else ''
 
-        # LLM extraction: read from the sentence column and produce LLM extracted + selected %
+        # LLM extraction: READ FULL ABSTRACT (text_orig) and produce LLM extracted + selected % + selected duration
         drug_hint = ""
         if drug_col_name and drug_col_name in df_in.columns:
             drug_hint = str(row.get(drug_col_name, '') or "")
 
-        # HbA1c LLM
-        hba_llm_extracted, hba_selected, _ = ([], "", "")
-        if _model is not None and sentence_str:
-            hba_llm_extracted, hba_selected, _ = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
+        # HbA1c LLM — pass the FULL abstract so model can pick the correct duration
+        hba_llm_extracted, hba_selected, hba_third = ([], "", "")
+        if _model is not None and text_orig:
+            hba_llm_extracted, hba_selected, hba_third = llm_extract_from_sentence(_model, "HbA1c", text_orig, drug_hint)
 
-        # Weight LLM
-        wt_llm_extracted, wt_selected, wt_selected_fallback = ([], "", "")
-        if _model is not None and weight_sentence_str:
-            wt_llm_extracted, wt_selected, wt_selected_fallback = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+        # Weight LLM — pass FULL abstract as well
+        wt_llm_extracted, wt_selected, wt_third = ([], "", "")
+        if _model is not None and text_orig:
+            wt_llm_extracted, wt_selected, wt_third = llm_extract_from_sentence(_model, "Body weight", text_orig, drug_hint)
+
+        # parse third slot for selected_duration if present (we used ' ||| ' separator when both exist)
+        def parse_third_for_duration(third):
+            if not third:
+                return "", ""
+            if '|||' in third:
+                left, right = [p.strip() for p in third.split('|||', 1)]
+                # decide which is duration vs kg/rel by checking for 'kg' or '%' in left/right
+                dur = ''
+                kgrel = ''
+                if re.search(r'\bkg\b', left) or left.endswith('%'):
+                    kgrel = left
+                else:
+                    dur = left
+                if re.search(r'\bkg\b', right) or right.endswith('%'):
+                    kgrel = right
+                else:
+                    dur = right
+                return kgrel, dur
+            else:
+                # single token — guess by pattern
+                t = third.strip()
+                if re.search(r'\bkg\b', t) or t.endswith('%'):
+                    return t, ''
+                # if it matches duration regex, return as duration
+                if DURATION_RE.search(t):
+                    return '', t
+                return '', t
+
+        # Extract selected kg/rel and duration from third slots
+        hba_selected_kgrel, hba_selected_duration = parse_third_for_duration(hba_third)
+        wt_selected_kgrel, wt_selected_duration   = parse_third_for_duration(wt_third)
 
         # --- FORCE precomputed relative into LLM outputs if LLM didn't pick one ---
         # For HbA1c: prefer precomputed relative (if present)
@@ -753,11 +805,11 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
         # Collect kg candidates and convert to percent
         kg_pct_candidates = []
-        # LLM-provided kg in fallback
-        if wt_selected_fallback and isinstance(wt_selected_fallback, str) and re.search(r'\bkg\b', wt_selected_fallback):
-            p = kg_to_percent_raw(wt_selected_fallback)
+        # LLM-provided kg in fallback (check wt_selected_kgrel first)
+        if wt_selected_kgrel and isinstance(wt_selected_kgrel, str) and re.search(r'\bkg\b', wt_selected_kgrel):
+            p = kg_to_percent_raw(wt_selected_kgrel)
             if p is not None:
-                kg_pct_candidates.append((p, wt_selected_fallback))
+                kg_pct_candidates.append((p, wt_selected_kgrel))
         # kg strings in extracted list
         for item in (wt_llm_extracted or []):
             if isinstance(item, str) and re.search(r'\bkg\b', item):
@@ -818,6 +870,10 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
                 return ""
         hba_selected = normalize_selected_hba(hba_selected)
 
+        # If LLM didn't provide duration, fall back to regex-extracted duration_str (first token)
+        hba_final_duration = hba_selected_duration if hba_selected_duration else (duration_str.split(' | ')[0] if duration_str else '')
+        wt_final_duration  = wt_selected_duration  if wt_selected_duration  else (duration_str.split(' | ')[0] if duration_str else '')
+
         # Scores
         a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(final_wt_selected_pct)
@@ -828,11 +884,13 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'extracted_matches': hba_regex_vals,
             'LLM extracted': hba_llm_extracted,
             'selected %': hba_selected,
+            'LLM selected duration': hba_final_duration,
             'A1c Score': a1c_score,
             'weight_sentence': weight_sentence_str,
             'weight_extracted_matches': wt_regex_vals,
             'Weight LLM extracted': wt_llm_extracted,
             'Weight selected %': final_wt_selected_pct,
+            'LLM weight duration': wt_final_duration,
             'Weight Score': weight_score,
             'duration': duration_str,  # NEW column appended here
         })
@@ -876,8 +934,8 @@ def insert_after(cols, after, names):
 
 display_df = out_df.copy()
 cols = list(display_df.columns)
-cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
-cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
+cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "LLM selected duration", "A1c Score"])
+cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "LLM weight duration", "Weight Score"])
 # keep user columns order + these additions
 # remove duplicates and keep order
 seen = set()
@@ -925,6 +983,6 @@ excel_bytes = to_excel_bytes(display_df)
 st.download_button(
     'Download results as Excel',
     data=excel_bytes,
-    file_name='results_with_llm_from_sentence.xlsx',
+    file_name='results_with_llm_from_abstract_and_duration.xlsx',
     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 )
