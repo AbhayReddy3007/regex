@@ -2,41 +2,53 @@
 """
 Streamlit app: HbA1c (A1c) extraction + scoring + duration column using regex + Gemini LLM.
 
-Logic:
+Key rules:
+
 1. Regex finds ONLY sentences that:
-   - Mention A1c / HbA1c / Hb A1c
-   - Contain a reduction cue (reduce/decrease/decline/fell/...)
-   - Contain a number with '%'
+   - Mention A1c / HbA1c / Hb A1c, AND
+   - Contain a reduction cue (reduce/decrease/decline/fell/...), AND
+   - Contain a number with '%', AND
+   - Are NOT responder-rate sentences like "proportion of subjects ... 82.4% vs 16%".
+
 2. These shortlisted sentences are sent to the LLM.
-3. LLM reads ONLY those shortlisted sentences to extract A1c reduction values.
-4. For phrases like "from X% to Y%", the LLM computes the RELATIVE reduction as:
-       ((X - Y) / X) * 100
-   and includes this as a candidate and (by default) selects it as the main A1c reduction.
-5. LLM also reads the FULL ABSTRACT to find duration.
-6. LLM receives an optional DRUG_HINT (from a drug-name column):
-   - It must only extract reductions clearly associated with that drug.
-   - It must ignore pure between-group differences (e.g. "mean difference -0.35%").
-7. Among available values, it selects the best A1c value and a score is assigned.
+
+3. LLM reads ONLY those shortlisted sentences to extract A1c reduction values
+   AND reads the FULL ABSTRACT for duration.
+
+4. LLM is instructed to:
+   - Treat A1c, HbA1c, Hb A1c as same.
+   - Ignore responder rates / % of subjects.
+   - Ignore insulin / dose / weight / BMI changes.
+   - Ignore baseline / target A1c values.
+   - Ignore pure between-group "difference" values (e.g., mean difference -0.35%).
+
+5. IMPORTANT POST-FILTER:
+   Any % value produced by the LLM that does NOT literally appear as a % in the
+   shortlisted sentences is discarded.
+   → Relative reductions like 25% hallucinated by the LLM are dropped.
+   → Relative reductions for "from X% to Y%" are handled by regex, not by LLM.
+
+6. Drug hint:
+   - Optional drug column is passed as DRUG_HINT.
+   - LLM is told to only extract A1c changes clearly tied to that drug (if given).
+
+7. selected % logic:
+   - If LLM A1c reduction values list is empty → selected % is empty (no regex fallback).
+   - If LLM list exists and all values are 0 → selected % = 0%.
+   - Else:
+       a) prefer LLM's selected_percent (if passes filtering),
+       b) then regex precomputed relative from-to (if any),
+       c) then first regex % value.
+
+8. A1c Score is computed from selected %.
 
 Columns:
-- shortlisted_sentences: sentences that passed the filters (A1c + reduction cue + %)
-- A1c reduction values: ALL A1c reduction values extracted by the LLM (joined with " | ")
-- selected %:
-    - If A1c reduction values (LLM) are empty → selected % is empty.
-    - If all A1c reduction values are 0 → selected % = 0%.
-    - Otherwise: LLM selected %, then regex relative, then regex first %.
-- A1c Score: score based on selected %
-- duration: trial/timepoint duration (LLM preferred, regex fallback)
-- LLM_status: LLM state per row
-- Optional drug column used as DRUG_HINT for LLM
-
-Usage:
-    # set your key in environment (recommended)
-    # Windows (cmd):   set GEMINI_API_KEY=YOUR_KEY
-    # PowerShell:      $env:GEMINI_API_KEY="YOUR_KEY"
-    # macOS/Linux:     export GEMINI_API_KEY=YOUR_KEY
-
-    streamlit run streamlit_a1c_llm_duration.py
+- shortlisted_sentences      : sentences used for A1c extraction
+- A1c reduction values       : ALL LLM-extracted A1c reduction values (joined with " | ")
+- selected %                 : chosen A1c reduction per rules above
+- A1c Score                  : numeric score from selected %
+- duration                   : LLM duration, or regex fallback
+- (debug) extracted_matches, LLM extracted, sentence
 """
 
 import re
@@ -44,6 +56,7 @@ import math
 import json
 import os
 from io import BytesIO
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -88,6 +101,12 @@ re_reduction_cue = re.compile(
     r'\b(from|reduc(?:e|ed|tion|ing)|decreas(?:e|ed|ing)|'
     r'drop(?:ped)?|fell|lower(?:ed|ing)?|declin(?:e|ed|ing))\b',
     FLAGS,
+)
+
+# NEW: pattern to avoid responder-rate sentences
+re_proportion_subjects = re.compile(
+    r'\b(proportion|percentage|percent)\s+of\s+(subjects|patients|participants)\b',
+    re.IGNORECASE,
 )
 
 # Duration regex (fallback)
@@ -215,15 +234,14 @@ def add_match(out, si, abs_start, m, typ, values, reduction):
 def extract_in_sentence(sent: str, si: int):
     matches = []
 
-    # 1) from X% to Y% (whole sentence)
+    # 1) from X% to Y% (whole sentence) – RELATIVE reduction from baseline X
     for m in re_fromto.finditer(sent):
         a = parse_number(m.group(1))
         b = parse_number(m.group(2))
         red_pp = None if (math.isnan(a) or math.isnan(b)) else (a - b)
         rel = None
-        # RELATIVE reduction = ((X - Y) / X) * 100  (baseline X)
         if not (math.isnan(a) or math.isnan(b)) and a != 0:
-            rel = ((a - b) / a) * 100.0
+            rel = ((a - b) / a) * 100.0  # baseline = X
         add_match(matches, si, 0, m, "from-to_sentence", [a, b], red_pp)
         if rel is not None:
             rel_raw = f"{rel:.6f}%"
@@ -296,11 +314,20 @@ def sentence_meets_criterion(sent: str) -> bool:
       1) A1c/HbA1c mention
       2) a reduction cue
       3) a numeric % (not just >=5%, <=7%, etc.)
+      4) MUST NOT be a responder-rate / proportion-of-subjects sentence
     """
     has_term = bool(re_hba1c.search(sent))
     has_pct = bool(re.search(r"(?<![<>≥≤])" + PCT, sent))
     has_cue = bool(re_reduction_cue.search(sent))
-    return bool(has_term and has_pct and has_cue)
+
+    if not (has_term and has_pct and has_cue):
+        return False
+
+    # Drop sentences like "proportion of subjects/patients ... 82.4% vs 16%"
+    if re_proportion_subjects.search(sent):
+        return False
+
+    return True
 
 
 def extract_sentences(text: str):
@@ -326,45 +353,18 @@ def extract_sentences(text: str):
 LLM_RULES = r"""
 You are an extraction assistant.
 
-IMPORTANT:
-- Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same measurement (they are synonyms).
-- Focus ONLY on reductions/changes in A1c/HbA1c, not on thresholds, goals, or target values.
-- You will also receive an optional DRUG_HINT. Use it to link values to a specific drug/group.
+CORE IDEA:
+- Treat "A1c", "HbA1c", and "Hb A1c" as exactly the same lab measurement.
+- Your ONLY job is to extract **change magnitudes in A1c/HbA1c** for a specific drug/group,
+  not anything else (not insulin dose, not weight, not proportions of patients, etc.).
 
 INPUT:
 - DRUG_HINT: a string with the target drug/regimen name (may be empty).
-- SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c, a reduction cue, and contain a percent.
+- SENTENCES_FOR_A1C: a small set of sentences that each mention A1c/HbA1c/Hb A1c and contain a percent.
 - FULL_ABSTRACT_FOR_DURATION: the entire abstract text.
 
-TASKS:
-1) From SENTENCES_FOR_A1C, extract all A1c/HbA1c change magnitudes (percent reductions), and choose the best single value.
-   - Include:
-     • group-specific reductions (e.g., "1.75% in the oral semaglutide group"),
-     • relative reductions computed from 'from X% to Y%' patterns (see special rule).
-   - EXCLUDE:
-     • values that represent ONLY between-group differences such as "difference", "mean difference",
-       "treatment difference", or "greater than" comparisons between two drugs.
-       Example: "HbA1c reduction was significantly greater with oral semaglutide than with empagliflozin
-       (mean difference -0.35%, p<0.001)" → do NOT extract "-0.35%" as an A1c reduction.
-2) From FULL_ABSTRACT_FOR_DURATION, identify the trial/timepoint duration associated with the main A1c result.
-
-DRUG LINKING RULE:
-- If DRUG_HINT is NON-EMPTY:
-  - You must only extract A1c reduction magnitudes that can be clearly linked to that drug/regimen.
-  - Look for explicit associations such as:
-       "in the DRUG_HINT group", "patients on DRUG_HINT had a reduction of 1.5%", "DRUG_HINT reduced HbA1c by 1.5%".
-  - Ignore changes clearly tied to other drugs or control groups.
-  - Ignore pure between-group differences (e.g., "mean difference -0.35% between DRUG_HINT and comparator").
-  - If you cannot confidently tie any valid A1c reduction to DRUG_HINT, return:
-       "extracted": []
-       and omit selected_percent (or leave it empty).
-- If DRUG_HINT is EMPTY:
-  - You may extract A1c reductions for any clearly defined arm, but still must ignore pure between-group
-    "difference" values.
-
-Return exactly ONE JSON object and NO extra text.
-
-Allowed keys:
+OUTPUT:
+Return exactly ONE JSON object and NO extra text. Allowed keys:
 {
   "extracted": ["1.75%", "1.35%", "25.0%"],
   "selected_percent": "25.0%",
@@ -372,31 +372,88 @@ Allowed keys:
   "confidence": 0.9
 }
 
-Rules for A1c reductions:
-- Percent strings must represent change magnitudes in A1c/HbA1c, NOT thresholds or goals.
-- In the JSON, percent values must be plain numeric strings with '%', e.g. "1.75%".
-- Ignore:
-  - thresholds like ">=5%" or "HbA1c <7.0%",
-  - sample-size percentages,
-  - p-values, confidence intervals, etc.
-- Also ignore pure between-group differences such as:
-  - "difference -0.35%", "mean difference -0.35%", "treatment difference 0.3%" etc.
+WHAT COUNTS AS A VALID A1c REDUCTION:
+You may ONLY extract a percent value if it clearly represents **how much A1c changed** over time
+for a group/arm. Typical valid patterns are:
 
-SPECIAL RULE: 'from X% to Y%' PATTERNS
-- When you see a phrase like "HbA1c decreased from X% to Y%" or "reduced from X% to Y%":
-  1) Compute the relative reduction using the BASELINE X:
-       relative_reduction = ((X - Y) / X) * 100
-     (Use X in the denominator, NOT Y.)
-  2) Normalize and round to a reasonable number of decimals (e.g., "25.0%").
-  3) Add this relative reduction to the `extracted` array.
-  4) **By default, set `selected_percent` to this relative reduction**, unless there is a clearly more important A1c reduction value for the DRUG_HINT.
+- "HbA1c decreased by 1.5%"
+- "A1c reduction of 1.2%"
+- "A1c fell 1.3%"
+- "HbA1c changed from 8.5% to 7.0%"
+- "mean change in A1c was -1.1%"
 
-Duration rule:
-- Duration must be human readable, e.g., "T12", "12 months", "26 weeks", "24-52 weeks".
-- If multiple timepoints are present, pick the one most clearly tied to the main A1c result
-  (prefer 12 months/T12 over 6 months/T6 when ambiguous).
+You must be able to read the text as "A1c changed by X%" (where X is your extracted value).
 
-Output must be STRICT JSON and parseable.
+ABSOLUTELY EXCLUDE THE FOLLOWING (DO NOT EXTRACT FROM THEM):
+1) Responder rates / proportions / percentages of patients
+   - Any % tied to phrases like:
+       - "proportion of subjects/patients/participants"
+       - "percentage of subjects/patients/participants"
+       - "percent of subjects/patients/participants"
+       - "proportion achieving"
+       - "percentage achieving"
+       - "patients achieving HbA1c <7%"
+       - "the proportion of subjects with any decrease in HbA1c was 82.4% vs 16%"
+   - These are about **how many patients responded**, not how much A1c changed.
+
+2) Between-group differences ONLY (no absolute A1c change)
+   - Phrases like:
+       - "difference -0.35%"
+       - "mean difference -0.35%"
+       - "treatment difference 0.3%"
+       - "HbA1c reduction was significantly greater with drug A than with drug B (mean difference -0.35%)"
+   - If the % is describing a **difference between two treatments**, and you are NOT given
+     the actual change for a specific arm, you must IGNORE this % completely.
+
+3) Insulin dose / medication dose / weight / anything that is NOT A1c
+   - Ignore any % clearly tied to:
+       - "insulin", "insulin dose", "insulin units"
+       - "dose", "dosage", "medication dose"
+       - "body weight", "weight", "kg", "BMI", "%BMIp95"
+   - Example:
+       "Patients with a baseline A1c of 8.0% or lower required a larger decrease in insulin
+        (-22.6% vs ...)."
+     → -22.6% is a change in insulin, NOT A1c.
+
+4) Baseline/target A1c values (no change described)
+   - Ignore values like:
+       - "baseline A1c of 8.2%"
+       - "A1c goal <7.0%"
+       - "patients with A1c ≤8.0%"
+   - These are baseline or target levels, not changes.
+   - Only extract if the text clearly says A1c **changed by** that amount or changed **from X to Y**.
+
+DRUG LINKING RULE (DRUG_HINT):
+- If DRUG_HINT is NON-EMPTY:
+  - You must only extract A1c change magnitudes that can be clearly linked to that drug/regimen.
+  - Look for explicit associations such as:
+       "in the DRUG_HINT group ... reduction of 1.5%",
+       "patients receiving DRUG_HINT had an HbA1c decrease of 1.3%",
+       "DRUG_HINT reduced HbA1c by 1.2%".
+  - Ignore changes clearly tied to other drugs or control groups.
+  - Ignore pure between-group difference values like "mean difference -0.35% between DRUG_HINT and comparator".
+  - If you cannot confidently tie any valid A1c reduction to DRUG_HINT, then:
+       "extracted": []
+       and do NOT set selected_percent (leave it empty or omit it).
+
+- If DRUG_HINT is EMPTY:
+  - You may extract A1c reductions for any clearly defined arm,
+    but still must ignore responder rates, dose changes, and between-group differences.
+
+NOTE ON RELATIVE REDUCTIONS:
+- Relative reductions from "from X% to Y%" are handled by the surrounding application logic.
+- You do NOT need to invent or compute new % values that are not explicitly present in the text.
+- Focus on identifying which explicit % values correspond to A1c change magnitudes.
+
+DURATION:
+- From FULL_ABSTRACT_FOR_DURATION, extract the main trial/timepoint duration tied to the A1c result:
+    e.g., "6 months", "26 weeks", "T12", "52 weeks", "24–52 weeks".
+- If multiple timepoints are present, pick the one most clearly tied to the primary A1c outcome.
+
+FINAL JSON:
+- Must be valid JSON, parseable, and contain at least:
+    "extracted": [...]   (can be an empty list)
+- Do NOT include any text outside the JSON object.
 """
 
 def configure_gemini(api_key: str):
@@ -432,13 +489,23 @@ def get_resp_text(resp):
     except Exception:
         return ""
 
-def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, drug_hint: str = ""):
+def llm_extract_a1c_and_duration(
+    model,
+    a1c_sentences: str,
+    full_abstract: str,
+    drug_hint: str = "",
+):
     """
     LLM reads:
       - shortlisted sentences for A1c values
       - full abstract for duration
       - optional drug hint
-    Returns (extracted_list, selected_percent, duration_str).
+
+    IMPORTANT POST-FILTER:
+    Any percent value suggested by the LLM that does NOT literally appear as a percent
+    in `a1c_sentences` is discarded.
+    Relative reductions (like 25%) that the LLM invents are dropped – relative reductions
+    are handled by regex for 'from X% to Y%' patterns.
     """
     global LLM_DEBUG_SHOWN
 
@@ -450,6 +517,20 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, 
         or not full_abstract.strip()
     ):
         return [], "", ""
+
+    # Collect all numeric % actually present in the shortlisted sentences
+    sentence_percent_nums = []
+    for m in re_pct.finditer(a1c_sentences):
+        n = parse_number(m.group(1))
+        if not math.isnan(n):
+            sentence_percent_nums.append(abs(n))
+
+    def appears_in_sentences(num: float, tol: float = 0.01) -> bool:
+        """Return True if num is (within tol) of any % value literally present in a1c_sentences."""
+        for s in sentence_percent_nums:
+            if abs(num - s) <= tol:
+                return True
+        return False
 
     header = ""
     if drug_hint:
@@ -483,6 +564,7 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, 
 
         data = json.loads(text[s : e + 1])
 
+        # Filtered extracted values: keep only % appearing in shortlisted sentences
         extracted = []
         for x in (data.get("extracted") or []):
             if not isinstance(x, str):
@@ -493,8 +575,11 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, 
             num = parse_number(m.group(1))
             if math.isnan(num):
                 continue
-            extracted.append(fmt_pct(abs(num)))
+            num_abs = abs(num)
+            if appears_in_sentences(num_abs):
+                extracted.append(fmt_pct(num_abs))
 
+        # selected_percent (also filtered)
         selected = ""
         selected_raw = data.get("selected_percent", "") or ""
         if isinstance(selected_raw, str) and selected_raw.strip():
@@ -502,7 +587,9 @@ def llm_extract_a1c_and_duration(model, a1c_sentences: str, full_abstract: str, 
             if m:
                 num = parse_number(m.group(1))
                 if not math.isnan(num):
-                    selected = fmt_pct(abs(num))
+                    num_abs = abs(num)
+                    if appears_in_sentences(num_abs):
+                        selected = fmt_pct(num_abs)
 
         duration = ""
         if isinstance(data.get("duration"), str):
@@ -543,7 +630,13 @@ def compute_a1c_score(selected_pct_str: str):
     return ""
 
 # -------------------- Processing --------------------
-def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_col_name: str | None):
+def process_df(
+    df_in: pd.DataFrame,
+    text_col: str,
+    model,
+    use_llm: bool,
+    drug_col_name: Optional[str],
+):
     rows = []
     for _, row in df_in.iterrows():
         text_orig = row.get(text_col, "")
@@ -560,6 +653,7 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_co
         hba_matches, hba_sentences = extract_sentences(text_orig)
         shortlisted = " | ".join(hba_sentences) if hba_sentences else ""
 
+        # Precomputed relative from-to (from regex)
         def _find_precomputed_relative(matches):
             for m in matches:
                 t = (m.get("type") or "").lower()
@@ -603,28 +697,19 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_co
 
         hba_regex_vals = [fmt_extracted(m) for m in hba_matches]
 
+        # LLM extraction
         llm_extracted, llm_selected, llm_duration = [], "", ""
         if use_llm and model is not None and shortlisted:
             llm_extracted, llm_selected, llm_duration = llm_extract_a1c_and_duration(
                 model, shortlisted, text_orig, drug_hint
             )
 
-        if not use_llm or model is None:
-            llm_status = "LLM DISABLED"
-        elif not shortlisted:
-            llm_status = "NO A1c SENTENCES"
-        elif not llm_extracted and not llm_selected and not llm_duration:
-            llm_status = "LLM NO OUTPUT"
-        else:
-            llm_status = "LLM OK"
-
         final_duration = llm_duration if llm_duration else duration_regex
 
-        # --------- A1c reduction values and selection logic ---------
         # A1c reduction values string (LLM only)
         a1c_reduction_values_str = " | ".join(llm_extracted) if llm_extracted else ""
 
-        # RULE: if no A1c reduction values from LLM → selected % must be empty (no regex fallback)
+        # If no LLM A1c reduction values → selected % must be empty (no regex fallback)
         if not llm_extracted:
             selected = ""
         else:
@@ -659,7 +744,6 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_co
                                 break
                             except Exception:
                                 continue
-        # -----------------------------------------------------------
 
         a1c_score = compute_a1c_score(selected)
 
@@ -674,7 +758,6 @@ def process_df(df_in: pd.DataFrame, text_col: str, model, use_llm: bool, drug_co
                 "selected %": selected,
                 "A1c Score": a1c_score,
                 "duration": final_duration,
-                "LLM_status": llm_status,
             }
         )
         rows.append(new)
@@ -775,10 +858,6 @@ if not show_debug:
             display_df = display_df.drop(columns=[c])
 
 st.dataframe(display_df.head(200))
-
-if use_llm and not out_df.empty:
-    if (display_df["LLM_status"] == "LLM OK").sum() == 0:
-        st.error("LLM seems to be enabled but did not return any usable output for any row.")
 
 counts = out_df.attrs.get("counts", None)
 if counts:
