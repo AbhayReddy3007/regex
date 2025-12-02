@@ -1,4 +1,5 @@
 # streamlit_hba1c_weight_llm_patched.py
+import os
 import re
 import math
 import json
@@ -8,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 # ===================== CONFIG =====================
+# You can either set API_KEY here or export GENAI_API_KEY in your environment
 API_KEY = ""   # <- leave blank or configure via environment / .env
 BASELINE_WEIGHT = 105.0  # kg (change if needed)
 BASELINE_A1C = 8.2       # default baseline A1c when x (start) is missing
@@ -198,33 +200,53 @@ def normalize_drug_name(name: str) -> str:
         return ''
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
+def tokenize_drug_name(name: str):
+    if not name:
+        return []
+    # split on non-alphanumeric and return tokens longer than 2 chars
+    toks = re.split(r'[^a-z0-9]+', name.lower())
+    return [t for t in toks if len(t) >= 2]
 
-def sentence_refers_to_drug(sentence: str, drug_name: str, aliases: list = None) -> bool:
+def sentence_refers_to_drug(sentence: str, drug_name: str, aliases: list = None, relax_match: bool = False) -> bool:
     """
     Heuristics to decide whether a sentence refers to a given drug_name.
     Returns True if we are confident the sentence talks about the drug.
+    If relax_match is True, allow LLM to run even if explicit token is missing.
     """
     if not drug_name:
         return False
     s = sentence.lower()
     dn = drug_name.lower().strip()
-    # direct substring
-    if dn in s:
+
+    # direct word boundary match first
+    if re.search(r'\b' + re.escape(dn) + r'\b', s):
         return True
-    # allow 'xxx group' patterns or 'in the xxx group'
-    if re.search(r'\b' + re.escape(dn) + r'\b\s+(?:group|arm|cohort|arm)\b', s):
-        return True
+
     # alias list
     if aliases:
         for a in aliases:
-            if a.lower().strip() in s:
+            if a and re.search(r'\b' + re.escape(a.lower().strip()) + r'\b', s):
                 return True
-    # normalized check (strip punctuation)
-    clean_s = re.sub(r'[^a-z0-9 ]', ' ', s)
-    if normalize_drug_name(dn) and normalize_drug_name(dn) in normalize_drug_name(clean_s):
-        return True
-    return False
 
+    # tokenized matching: require at least one or two tokens match depending on length
+    tokens = tokenize_drug_name(dn)
+    if tokens:
+        hits = 0
+        for t in tokens:
+            if t and re.search(r'\b' + re.escape(t) + r'\b', s):
+                hits += 1
+        if hits >= 1:  # tolerate single token match (e.g., 'semaglutide' -> 'semaglut')
+            return True
+
+    # 'xxx group' patterns or variations
+    if re.search(r'\b' + re.escape(dn) + r'\b\s*(?:group|arm|cohort|treatment)\b', s) or re.search(r'(?:group|arm)\s*(?:[:\-]?\s*)' + re.escape(dn), s):
+        return True
+
+    # if relaxed, allow LLM to proceed (useful for debugging/when drug mention is elsewhere)
+    if relax_match:
+        return True
+
+    return False
 
 def find_group_label(sent: str) -> str:
     m = GROUP_RE.search(sent)
@@ -235,18 +257,15 @@ def find_group_label(sent: str) -> str:
             return g.strip().lower()
     return ""
 
-
 RE_MG = re.compile(r'([+-]?\d+(?:[.,]\d+)?)\s*mg', re.I)
 RE_MONTHS = re.compile(r'\b(T\d{1,2}|\d{1,2}\s*(?:months|mos|mo|m))\b', re.I)
 RE_KG = re.compile(r'([+-]?\d+(?:[.,]\d+)?)\s*(?:kg|kilograms?)', re.I)
-
 
 def parse_strength(sent: str):
     m = RE_MG.search(sent)
     if m:
         return parse_number(m.group(1))
     return None
-
 
 def parse_timepoint_months(sent: str):
     m = RE_MONTHS.search(sent)
@@ -362,14 +381,14 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
     return uniq
 
 
-def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str, row_drug_name: str = '', aliases: list = None):
+def extract_sentences(text: str, term_re: re.Pattern, tag_prefix: str, row_drug_name: str = '', aliases: list = None, relax_drug_matching: bool = False):
     """Return (matches, sentences_used) for sentences meeting the criterion and that refer to the row's drug."""
     matches, sentences_used = [], []
     for si, sent in enumerate(split_sentences(text)):
         if not sentence_meets_criterion(sent, term_re):
             continue
-        # drug check: if the sentence doesn't refer to the row's drug, skip
-        if row_drug_name and not sentence_refers_to_drug(sent, row_drug_name, aliases):
+        # drug check: if the sentence doesn't refer to the row's drug, skip (unless relax flag)
+        if row_drug_name and not sentence_refers_to_drug(sent, row_drug_name, aliases, relax_match=relax_drug_matching):
             continue
         sentences_used.append(sent)
         matches.extend(extract_in_sentence(sent, si, term_re, tag_prefix))
@@ -394,6 +413,7 @@ drug_col   = st.sidebar.text_input('Column with drug name (optional)', value='dr
 sheet_name = st.sidebar.text_input('Excel sheet name (blank = first sheet)', value='')
 show_debug = st.sidebar.checkbox('Show debug columns (reductions_pp, reduction_types)', value=False)
 use_llm   = st.sidebar.checkbox('Enable Gemini LLM (Gemini 2.0 Flash)', value=True)
+relax_drug_matching = st.sidebar.checkbox('Relax drug matching (allow LLM to run even if sentence lacks explicit drug token)', value=False)
 
 if not uploaded:
     st.info('Upload your Excel or CSV file in the left sidebar. Example: my_abstracts.xlsx with column named "abstract".')
@@ -424,17 +444,19 @@ st.success(f'Loaded {len(df)} rows. Processing...')
 
 # -------------------- Gemini 2.0 Flash setup --------------------
 def configure_gemini(api_key: str):
-    if not GENAI_AVAILABLE or not api_key:
+    # allow picking API key from environment if not set in file
+    key = api_key or os.getenv('GENAI_API_KEY') or ""
+    if not GENAI_AVAILABLE or not key:
         return None
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=key)
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
 
 model = configure_gemini(API_KEY) if use_llm else None
 
-# ---- missing helper fixed: normalize percent strings ----
+# ---- helper: normalize percent strings ----
 def _norm_percent(v: str) -> str:
     """Normalize a percent-like string to ensure it ends with '%' and uses '.' as decimal."""
     v = (v or "").strip().replace(" ", "")
@@ -490,14 +512,13 @@ KEY PRINCIPLES (strict)
 8) Only return the JSON object and nothing else.
 """
 
-
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
     Returns parsed JSON-like structures or ([], {}) on failure.
     If model is None, returns ([], {}).
     """
     if model is None or not sentence.strip():
-        return [], {}
+        return [], {}, ""
 
     prompt = (
         f"TARGET: {target_label}\n"
@@ -509,6 +530,7 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
 
     try:
         resp = model.generate_content(prompt)
+        # resp may be an object; grab text
         text = (getattr(resp, "text", "") or "").strip()
         # find JSON object in response
         s, e = text.find("{"), text.rfind("}")
@@ -523,10 +545,8 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 if not isinstance(x, dict):
                     continue
                 if x.get('type') == 'kg' and 'percent' not in x:
-                    # nothing to do here, kg will be converted by caller using baseline
                     pass
                 if 'value' in x and isinstance(x['value'], str) and x['value'].strip().endswith('%'):
-                    # normalize percent formatting
                     try:
                         num = parse_number(x['value'].replace('%', ''))
                         if not math.isnan(num):
@@ -535,10 +555,12 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                     except:
                         pass
                 normed.append(x)
-            return normed, selected
-    except Exception:
-        return [], {}
-    return [], {}
+            return normed, selected, text
+        else:
+            # no JSON object found — return raw text for debugging
+            return [], {}, text
+    except Exception as ex:
+        return [], {}, f"LLM error: {ex}"
 
 # -------------------- Scoring helpers (unchanged) --------------------
 def compute_a1c_score(selected_pct_str: str):
@@ -582,7 +604,7 @@ def compute_weight_score(selected_pct_str: str):
 
 # -------------------- Processing function (patched) --------------------
 @st.cache_data
-def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
+def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str, relax_drug_matching_flag: bool = False):
     rows = []
     for _, row in df_in.iterrows():
         text_orig = row.get(text_col, '')
@@ -597,12 +619,11 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         aliases = None
         if drug_col_name and drug_col_name in df_in.columns:
             drug_hint = str(row.get(drug_col_name, '') or '')
-            # simple aliasing: lowercase and remove punctuation; user can supply better alias maps
             aliases = [drug_hint]
 
-        # Run regex extraction (now with per-row drug filter)
-        hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c', drug_hint, aliases)
-        wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight', drug_hint, aliases)
+        # Run regex extraction (now with per-row drug filter, optionally relaxed)
+        hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c', drug_hint, aliases, relax_drug_matching_flag)
+        wt_matches, wt_sentences   = extract_sentences(text_orig, re_weight, 'weight', drug_hint, aliases, relax_drug_matching_flag)
 
         # ------------------ compute precomputed relative values (from regex) ------------------
         def _find_relative_fromto(matches, baseline_for_missing=None):
@@ -661,26 +682,26 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         weight_sentence_str = ' | '.join(wt_sentences) if wt_sentences else ''
 
         # LLM extraction: read from the sentence column and produce LLM extracted + selected %
-        hba_llm_extracted, hba_selected = ([], {})
+        hba_llm_extracted, hba_selected, hba_llm_raw = ([], {}, "")
         if _model is not None and sentence_str:
-            hba_llm_extracted, hba_selected = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
+            hba_llm_extracted, hba_selected, hba_llm_raw = llm_extract_from_sentence(_model, "HbA1c", sentence_str, drug_hint)
 
-        wt_llm_extracted, wt_selected = ([], {})
+        wt_llm_extracted, wt_selected, wt_llm_raw = ([], {}, "")
         if _model is not None and weight_sentence_str:
-            wt_llm_extracted, wt_selected = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
+            wt_llm_extracted, wt_selected, wt_llm_raw = llm_extract_from_sentence(_model, "Body weight", weight_sentence_str, drug_hint)
 
         # --- FORCE precomputed relative into LLM outputs if LLM didn't pick one ---
         if precomputed_hba_rel:
-            # ensure it's present in the list
             if precomputed_hba_rel not in ([(x.get('value') if isinstance(x, dict) else x) for x in hba_llm_extracted]):
-                # prepend a small synthetic candidate
-                hba_llm_extracted = ([{'value': precomputed_hba_rel, 'type': 'percent', 'percent': parse_number(precomputed_hba_rel.replace('%',''))}] if not hba_llm_extracted else [{'value': precomputed_hba_rel, 'type': 'percent', 'percent': parse_number(precomputed_hba_rel.replace('%',''))}] + hba_llm_extracted)
+                synth = {'value': precomputed_hba_rel, 'type': 'percent', 'percent': parse_number(precomputed_hba_rel.replace('%',''))}
+                hba_llm_extracted = ([synth] if not hba_llm_extracted else [synth] + hba_llm_extracted)
             if not hba_selected:
                 hba_selected = {'a1c_percent': precomputed_hba_rel}
 
         if precomputed_wt_rel:
             if precomputed_wt_rel not in ([(x.get('value') if isinstance(x, dict) else x) for x in wt_llm_extracted]):
-                wt_llm_extracted = ([{'value': precomputed_wt_rel, 'type': 'percent', 'percent': parse_number(precomputed_wt_rel.replace('%',''))}] if not wt_llm_extracted else [{'value': precomputed_wt_rel, 'type': 'percent', 'percent': parse_number(precomputed_wt_rel.replace('%',''))}] + wt_llm_extracted)
+                synth = {'value': precomputed_wt_rel, 'type': 'percent', 'percent': parse_number(precomputed_wt_rel.replace('%',''))}
+                wt_llm_extracted = ([synth] if not wt_llm_extracted else [synth] + wt_llm_extracted)
             if not wt_selected:
                 wt_selected = {'weight_percent': precomputed_wt_rel}
 
@@ -708,7 +729,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
                         kg_values.append(kg_str)
 
         if kg_values:
-            # attach kg_values as dicts into wt llm extracted
             wt_llm_extracted = (wt_llm_extracted or []) + [{'value': k, 'type': 'kg'} for k in kg_values]
 
         # If LLM extracted is empty, ensure selected remains empty
@@ -761,7 +781,6 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
                         if p is not None:
                             out.append((p, val, meta))
                     else:
-                        # fallback: if dict has numeric 'percent'
                         if 'percent' in it and isinstance(it['percent'], (int, float)):
                             out.append((abs(float(it['percent'])), fmt_pct(abs(float(it['percent']))), meta))
                 elif isinstance(it, str):
@@ -884,6 +903,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'sentence': sentence_str,
             'extracted_matches': hba_regex_vals,
             'LLM extracted': hba_llm_extracted,
+            'LLM_raw_response': hba_llm_raw or wt_llm_raw or "",
             'selected %': chosen_hba_pct,
             'A1c Score': a1c_score,
             'weight_sentence': weight_sentence_str,
@@ -901,6 +921,11 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
     def has_items(x):
         return isinstance(x, list) and len(x) > 0
 
+    if len(out) == 0:
+        out = pd.DataFrame(columns=list(df_in.columns) + ['sentence','extracted_matches','LLM extracted','LLM_raw_response','selected %','A1c Score','weight_sentence','weight_extracted_matches','Weight LLM extracted','Weight selected %','Weight Score','duration'])
+        out.attrs['counts'] = dict(kept=0, total=0, hba_only=0, wt_only=0, both=0)
+        return out
+
     mask_hba = (out['sentence'].astype(str).str.len() > 0) & (out['extracted_matches'].apply(has_items))
     mask_wt  = (out['weight_sentence'].astype(str).str.len() > 0) & (out['weight_extracted_matches'].apply(has_items))
     mask_keep = mask_hba | mask_wt
@@ -917,7 +942,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
     return out
 
 # Run processing
-out_df = process_df(model, df, col_name, drug_col)
+out_df = process_df(model, df, col_name, drug_col, relax_drug_matching_flag=relax_drug_matching)
 
 # -------------------- Reorder columns: place LLM columns BESIDE regex columns --------------------
 def insert_after(cols, after, names):
@@ -932,7 +957,7 @@ def insert_after(cols, after, names):
 
 display_df = out_df.copy()
 cols = list(display_df.columns)
-cols = insert_after(cols, "extracted_matches", ["LLM extracted", "selected %", "A1c Score"])
+cols = insert_after(cols, "extracted_matches", ["LLM extracted", "LLM_raw_response", "selected %", "A1c Score"])
 cols = insert_after(cols, "weight_extracted_matches", ["Weight LLM extracted", "Weight selected %", "Weight Score"])
 seen = set()
 new_cols = []
