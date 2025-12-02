@@ -7,8 +7,7 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-# ===================== HARD-CODE YOUR GEMINI KEY HERE =====================
-API_KEY = "AIzaSyDssnXWBO8mL54Ulf08TaHsDqaQoX0gY-k"   # <- replace with your real key
+# ===================== HARD-CODE YOUR GEMINI KEY HERE =====================   # <- replace with your real key
 # =========================================================================
 
 # Baseline weight for converting kg -> percent
