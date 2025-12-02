@@ -434,6 +434,26 @@ def configure_gemini(api_key: str):
 
 model = configure_gemini(API_KEY) if use_llm else None
 
+# ---- missing helper fixed: normalize percent strings ----
+def _norm_percent(v: str) -> str:
+    """Normalize a percent-like string to ensure it ends with '%' and uses '.' as decimal."""
+    v = (v or "").strip().replace(" ", "")
+    if not v:
+        return ""
+    # if it's purely numeric, append %
+    if re.match(r"^[+-]?\d+(?:[.,·]\d+)?$", v):
+        v = v.replace(",", ".").replace("·", ".") + "%"
+    # if it already ends with % normalize decimal separator and format nicely
+    if v.endswith("%"):
+        num = v[:-1].replace(",", ".").replace("·", ".")
+        try:
+            f = float(num)
+            s = f"{f:.2f}".rstrip("0").rstrip(".")
+            return s + "%"
+        except Exception:
+            return v
+    return v
+
 # -------------------- DETAILED LLM RULES (patched) --------------------
 LLM_RULES = """
 You are a focused information-extraction assistant. Read the provided SENTENCE(S) and extract change magnitudes that represent reported changes for the specified TARGET (either "HbA1c"/"A1c" or "Body weight"). Return strict JSON only (no explanation, no commentary, no extra text). Follow these rules exactly.
