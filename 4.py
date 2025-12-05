@@ -14,6 +14,9 @@ API_KEY = ""   # <- replace with your real key
 # Baseline weight for converting kg -> percent
 BASELINE_WEIGHT = 105.0  # kg (change if needed)
 
+# Baseline A1c for relative reduction when only target threshold is reported
+BASELINE_A1C = 8.2  # %
+
 # Lazy Gemini import so the app still runs without the package
 GENAI_AVAILABLE = False
 try:
@@ -50,6 +53,13 @@ re_reduction_cue = re.compile(
 )
 # units for weight (kg/kilogram)
 re_weight_unit = re.compile(r'\bkg\b|\bkilograms?\b', FLAGS)
+
+# Pattern for “achieved HbA1c/A1c ≤ x% / < x%” (used with baseline A1c)
+THRESH_A1C_RE = re.compile(
+    r'\b(?:achiev(?:e|ed|ing|ement)?|attain(?:ed|ment)?|target)\b[^.]*?'
+    r'\b(?:hb\s*a1c|hba1c|a1c)\b[^<%]*?(?:≤|<=|<)\s*([+-]?\d+(?:[.,·]\d+)?)\s*%',
+    FLAGS
+)
 
 # -------------------- Utilities --------------------
 def parse_number(s: str) -> float:
@@ -91,12 +101,12 @@ def fmt_pct(v):
 
 # Duration extraction helper (new)
 DURATION_RE = re.compile(
-    r'\b(?:T\d{1,2}|'                                       # T6, T12
-    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:weeks?|wks?|wk|w)\b|'   # 12 weeks, 6-12 weeks
-    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:months?|mos?|mo)\b|'    # 6 months, 12-mo, 6-12 months
-    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:days?|d)\b|'            # days
-    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:years?|yrs?)\b|'        # years
-    r'\d{1,3}-week\b|\d{1,3}-month\b|\d{1,3}-mo\b)',         # hyphenated forms
+    r'\b(?:T\d{1,2}|'
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:weeks?|wks?|wk|w)\b|'
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:months?|mos?|mo)\b|'
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:days?|d)\b|'
+    r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:years?|yrs?)\b|'
+    r'\d{1,3}-week\b|\d{1,3}-month\b|\d{1,3}-mo\b)',
     FLAGS
 )
 
@@ -246,8 +256,6 @@ def extract_in_sentence(sent: str, si: int, term_re: re.Pattern, tag_prefix: str
             for m in re.finditer(r'([+-]?\d+(?:[.,·]\d+)?)\s*(?:kg|kilograms?)', seg, FLAGS):
                 any_window_hit = True
                 v = parse_number(m.group(1))
-                # store kg as raw value (e.g., '3.5 kg') — reduction_pp field will hold the numeric kg
-                # we keep 'values' as [v, 'kg'] to indicate unit
                 add_match(matches, si, abs_s, m, f'{tag_prefix}:kg_pmSpaces5', [v, 'kg'], v)
 
     # 3) Weight safety: nearest previous % within 60 chars if no window hit
@@ -503,7 +511,6 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
                 if re.search(r'[<>≥≤]', x2):
                     continue
                 if re.match(r'^[+-]?\d+(?:[.,·]\d+)?%$', x2):
-                    # Normalise percent and keep sign stripped for extracted (we keep candidate as-is)
                     extracted.append(_norm_percent(x2))
             # selected_percent if present
             selected = _norm_percent(data.get("selected_percent", "") or "")
@@ -717,6 +724,22 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         # ONLY attach kg_values to weight LLM extracted (do NOT attach kg to HbA1c LLM extracted)
         if kg_values:
             wt_llm_extracted = (wt_llm_extracted or []) + kg_values
+
+        # ---- Baseline A1c threshold handling (achieved HbA1c/A1c <= x% or < x%) ----
+        # Only apply if no A1c reduction % has been selected yet.
+        if not hba_selected and BASELINE_A1C and not math.isnan(BASELINE_A1C):
+            m_thresh = THRESH_A1C_RE.search(text_orig)
+            if m_thresh:
+                target_a1c = parse_number(m_thresh.group(1))
+                if not math.isnan(target_a1c) and BASELINE_A1C != 0:
+                    rel = ((BASELINE_A1C - target_a1c) / float(BASELINE_A1C)) * 100.0
+                    rel_pct_str = fmt_pct(rel)
+                    if not hba_llm_extracted:
+                        hba_llm_extracted = []
+                    if rel_pct_str not in hba_llm_extracted:
+                        hba_llm_extracted = [rel_pct_str] + hba_llm_extracted
+                    hba_selected = rel_pct_str
+        # ---------------------------------------------------------------------------
 
         # If LLM extracted is empty, ensure selected remains empty (explicit requirement)
         if not hba_llm_extracted:
