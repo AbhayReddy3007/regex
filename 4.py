@@ -911,10 +911,14 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         duration_str = duration_regex_str
         if _model is not None and (a1c_score or weight_score):
             dur_list, primary_dur = llm_extract_duration(_model, text_orig, drug_hint)
-            if dur_list:
-                duration_str = " | ".join(dur_list)
-            elif primary_dur:
+            # *** CHANGED BLOCK: use ONLY the LLM's single best duration ***
+            if primary_dur:
                 duration_str = primary_dur
+            elif duration_regex_str:
+                duration_str = duration_regex_str
+            elif dur_list:
+                # fallback: if LLM gives only a list, pick the first
+                duration_str = dur_list[0]
         # -------------------------------------------------------------------------------
 
         new = row.to_dict()
