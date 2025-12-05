@@ -99,7 +99,7 @@ def fmt_pct(v):
     s = f"{float(v):.2f}".rstrip('0').rstrip('.')
     return f"{s}%"
 
-# Duration extraction helper (new)
+# Duration extraction helper (regex baseline)
 DURATION_RE = re.compile(
     r'\b(?:T\d{1,2}|'
     r'\d{1,3}\s*(?:-\s*\d{1,3}\s*)?(?:weeks?|wks?|wk|w)\b|'
@@ -110,8 +110,8 @@ DURATION_RE = re.compile(
     FLAGS
 )
 
-def extract_durations(text: str) -> str:
-    """Return a deduped, ordered string of duration mentions found in text separated by ' | '."""
+def extract_durations_regex(text: str) -> str:
+    """Regex-based fallback duration extractor."""
     if not isinstance(text, str) or not text.strip():
         return ""
     found = []
@@ -465,6 +465,30 @@ KEY PRINCIPLES (strict)
 
 """
 
+# -------------------- LLM RULES FOR DURATION --------------------
+LLM_DURATION_RULES = """
+You are a precise information-extraction assistant. Read the full ABSTRACT and extract the study duration/timepoints.
+
+Return JSON only, with this structure:
+
+{
+  "durations": ["24 weeks", "52 weeks", "T12", "12 months"],   // array of all relevant duration mentions
+  "primary_duration": "52 weeks"                               // single best/primary follow-up duration
+}
+
+Rules:
+- Consider phrases like: "24 weeks", "26 weeks", "52-week", "1 year", "2 years", "12 months", "6 months", "T6", "T12", "week 26", "week 52".
+- Normalize:
+  - Use "weeks", "months", "years" (e.g., "52 weeks", "12 months", "2 years").
+  - Keep T-timepoints as "T6", "T12", etc.
+- Include all relevant follow-up durations in "durations".
+- For "primary_duration":
+  - Prefer the *longest* clearly reported follow-up that corresponds to primary/endpoint results (e.g., 52 weeks > 26 weeks; 12 months > 6 months).
+  - If multiple candidates have similar length, you may choose any that clearly reflects main follow-up.
+- Do NOT include durations that are clearly not study follow-up (e.g., "washout for 3 days" if the main outcome is at 24 weeks).
+- JSON only, no explanation.
+"""
+
 def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint: str = ""):
     """
     Returns (extracted_list (strings like '1.23%' or '3.5 kg'), selected_percent (string like '1.23%'), selected_kg_or_rel (string))
@@ -544,6 +568,40 @@ def llm_extract_from_sentence(model, target_label: str, sentence: str, drug_hint
 
     return [], "", ""
 
+def llm_extract_duration(model, abstract_text: str, drug_hint: str = ""):
+    """
+    Use LLM to extract duration/timepoints from the FULL ABSTRACT.
+    Returns (durations_list, primary_duration_str)
+    """
+    if model is None or not abstract_text.strip():
+        return [], ""
+
+    prompt = (
+        "TARGET: Duration\n"
+        + (f"DRUG_HINT: {drug_hint}\n" if drug_hint else "")
+        + LLM_DURATION_RULES + "\n"
+        + "ABSTRACT:\n" + abstract_text + "\n"
+        + "Return JSON only.\n"
+    )
+
+    try:
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", "") or "").strip()
+        s, e = text.find("{"), text.rfind("}")
+        if s != -1 and e > s:
+            data = json.loads(text[s:e+1])
+            durations = []
+            for x in (data.get("durations") or []):
+                x = str(x).strip()
+                if x:
+                    durations.append(x)
+            primary = (data.get("primary_duration") or "").strip()
+            return durations, primary
+    except Exception:
+        return [], ""
+
+    return [], ""
+
 # -------------------- Scoring helpers --------------------
 def compute_a1c_score(selected_pct_str: str):
     """Scores for A1c:
@@ -606,8 +664,8 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         if not isinstance(text_orig, str):
             text_orig = '' if pd.isna(text_orig) else str(text_orig)
 
-        # Extract duration info (new)
-        duration_str = extract_durations(text_orig)
+        # Regex-based duration baseline
+        duration_regex_str = extract_durations_regex(text_orig)
 
         # Run regex extraction
         hba_matches, hba_sentences = extract_sentences(text_orig, re_hba1c, 'hba1c')
@@ -802,16 +860,13 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
 
         # Now pick the highest percent among pct_candidates and kg_pct_candidates
         best_num = None
-        best_source = None  # string representation
         if pct_candidates:
             pct_candidates.sort(key=lambda x: x[0], reverse=True)
             best_num = pct_candidates[0][0]
-            best_source = pct_candidates[0][1]
         if kg_pct_candidates:
             kg_pct_candidates.sort(key=lambda x: x[0], reverse=True)
             if best_num is None or kg_pct_candidates[0][0] > best_num:
                 best_num = kg_pct_candidates[0][0]
-                best_source = fmt_pct(kg_pct_candidates[0][0])
 
         final_wt_selected_pct = ""
         if best_num is not None:
@@ -852,6 +907,16 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
         a1c_score = compute_a1c_score(hba_selected)
         weight_score = compute_weight_score(final_wt_selected_pct)
 
+        # ---- LLM-based duration extraction (only when A1c or Weight score present) ----
+        duration_str = duration_regex_str
+        if _model is not None and (a1c_score or weight_score):
+            dur_list, primary_dur = llm_extract_duration(_model, text_orig, drug_hint)
+            if dur_list:
+                duration_str = " | ".join(dur_list)
+            elif primary_dur:
+                duration_str = primary_dur
+        # -------------------------------------------------------------------------------
+
         new = row.to_dict()
         new.update({
             'sentence': sentence_str,
@@ -864,7 +929,7 @@ def process_df(_model, df_in: pd.DataFrame, text_col: str, drug_col_name: str):
             'Weight LLM extracted': wt_llm_extracted,
             'Weight selected %': final_wt_selected_pct,
             'Weight Score': weight_score,
-            'duration': duration_str,  # NEW column appended here
+            'duration': duration_str,  # duration now LLM-driven when scores present
         })
         rows.append(new)
 
